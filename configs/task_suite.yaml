@@ -1,0 +1,216 @@
+# DMS 复现工程 —— 任务子集定义
+#
+# 来源：AndroidWorld 官方 `android_world` task family（`registry.TaskRegistry.ANDROID_WORLD_FAMILY`），
+# 共 116 个任务、覆盖 20 个真实第三方 App（见 android_world/env/setup_device/apps.py 中
+# 除 `android world`(自身测试用) 与 `miniwob` 之外的全部 AppSetup 子类）。
+#
+# 抽样原则：
+#   1. 覆盖全部 20 个 App，每个 App 抽 1-2 个任务；
+#   2. 难度分层：complexity <= 1.5 记为 easy，1.5~4 记为 medium，> 4 记为 hard；
+#      本子集 easy:medium:hard 大致为 15:11:3，覆盖三档；
+#   3. 至少包含 2-3 个「长序列/组合」任务（complexity 高或跨 App 组合），
+#      用于体现 DMS 分层记忆与跨 sub-task 复用的价值；本子集含 5 个此类任务
+#      （标记 tags 含 composite 或 long_sequence）：
+#        - TurnOffWifiAndTurnOnBluetooth（composite，跨两个系统开关子任务）
+#        - MarkorCreateNoteAndSms（composite，跨 Markor + SMS 两个 App）
+#        - MarkorMergeNotes（complexity 7.8，长文件操作序列）
+#        - ExpenseAddMultiple（complexity 6.0，多条目重复录入）
+#        - RetroSavePlaylist（complexity 5.0，多步媒体库操作）
+#   4. complexity 字段直接取自 AndroidWorld 任务类的 `complexity` 属性，用于按论文约定
+#      设定每个任务的最大步数上限（通常 `max_steps = complexity * 10`）。
+#
+# 每个任务在每一轮（round）会用 `generate_random_params()` 重新随机化参数再实例化，
+# 用于避免智能体对具体参数值“死记硬背”，只允许复用 sub-plan 级别的策略记忆。
+
+meta:
+  source_family: android_world          # registry.TaskRegistry.ANDROID_WORLD_FAMILY
+  total_tasks_in_family: 116
+  total_apps_in_family: 20
+  selected_task_count: 29
+  selected_app_count: 20
+  difficulty_tiers:
+    easy: "complexity <= 1.5"
+    medium: "1.5 < complexity <= 4.0"
+    hard: "complexity > 4.0"
+  difficulty_distribution: {easy: 15, medium: 11, hard: 3}
+  composite_or_long_sequence_count: 5
+  rounds_per_task: 5
+  conditions: [baseline_a_zero_shot, baseline_b_static_memory, dms]
+
+tasks:
+  - name: CameraTakePhoto
+    apps: [camera]
+    complexity: 1.0
+    difficulty: easy
+    tags: []
+
+  - name: CameraTakeVideo
+    apps: [camera]
+    complexity: 1.0
+    difficulty: easy
+    tags: []
+
+  - name: BrowserMultiply
+    apps: [chrome]
+    complexity: 2.2
+    difficulty: medium
+    tags: []
+
+  - name: ClockTimerEntry
+    apps: [clock]
+    complexity: 1.0
+    difficulty: easy
+    tags: []
+
+  - name: ClockStopWatchRunning
+    apps: [clock]
+    complexity: 1.0
+    difficulty: easy
+    tags: []
+    note: "已在环境 smoke test 中运行过一次（该次因 7B 模型臆造 app 名失败，见 results/smoke_test/README.md）；保留在正式任务集中以获得跨 3 条件、5 round 的完整对比数据。"
+
+  - name: ContactsAddContact
+    apps: [contacts]
+    complexity: 1.2
+    difficulty: easy
+    tags: []
+
+  - name: FilesMoveFile
+    apps: [files]
+    complexity: 2.0
+    difficulty: medium
+    tags: []
+
+  - name: SystemWifiTurnOn
+    apps: [settings]
+    complexity: 1.0
+    difficulty: easy
+    tags: []
+
+  - name: TurnOffWifiAndTurnOnBluetooth
+    apps: [settings]
+    complexity: 2.0
+    difficulty: medium
+    tags: [composite]
+    module: android_world.task_evals.composite.system
+
+  - name: MarkorCreateNoteAndSms
+    apps: [markor, "simple sms messenger"]
+    complexity: 1.8
+    difficulty: medium
+    tags: [composite, cross_app]
+    module: android_world.task_evals.composite.markor_sms
+
+  - name: MarkorMergeNotes
+    apps: [markor]
+    complexity: 7.8
+    difficulty: hard
+    tags: [long_sequence]
+
+  - name: SimpleCalendarAddOneEvent
+    apps: ["simple calendar pro"]
+    complexity: 3.4
+    difficulty: medium
+    tags: []
+
+  - name: SimpleCalendarDeleteEvents
+    apps: ["simple calendar pro"]
+    complexity: 1.4
+    difficulty: easy
+    tags: []
+
+  - name: TasksDueOnDate
+    apps: [tasks]
+    complexity: 1.0
+    difficulty: easy
+    tags: [info_retrieval]
+
+  - name: SimpleDrawProCreateDrawing
+    apps: ["simple draw pro"]
+    complexity: 1.8
+    difficulty: medium
+    tags: []
+
+  - name: SaveCopyOfReceiptTaskEval
+    apps: ["simple gallery pro"]
+    complexity: 1.6
+    difficulty: medium
+    tags: []
+
+  - name: SimpleSmsSend
+    apps: ["simple sms messenger"]
+    complexity: 1.2
+    difficulty: easy
+    tags: []
+
+  - name: SimpleSmsReply
+    apps: ["simple sms messenger"]
+    complexity: 1.2
+    difficulty: easy
+    tags: []
+
+  - name: AudioRecorderRecordAudio
+    apps: ["audio recorder"]
+    complexity: 1.2
+    difficulty: easy
+    tags: []
+
+  - name: ExpenseAddSingle
+    apps: ["pro expense"]
+    complexity: 1.2
+    difficulty: easy
+    tags: []
+
+  - name: ExpenseAddMultiple
+    apps: ["pro expense"]
+    complexity: 6.0
+    difficulty: hard
+    tags: [long_sequence]
+
+  - name: RecipeAddSingleRecipe
+    apps: ["broccoli app"]
+    complexity: 2.4
+    difficulty: medium
+    tags: []
+
+  - name: RecipeDeleteDuplicateRecipes
+    apps: ["broccoli app"]
+    complexity: 1.0
+    difficulty: easy
+    tags: []
+
+  - name: OsmAndMarker
+    apps: [osmand]
+    complexity: 2.0
+    difficulty: medium
+    tags: []
+
+  - name: SportsTrackerActivityDuration
+    apps: ["open tracks sports tracker"]
+    complexity: 1.2
+    difficulty: easy
+    tags: [info_retrieval]
+
+  - name: VlcCreatePlaylist
+    apps: [vlc]
+    complexity: 2.8
+    difficulty: medium
+    tags: []
+
+  - name: NotesTodoItemCount
+    apps: [joplin]
+    complexity: 1.0
+    difficulty: easy
+    tags: [info_retrieval]
+
+  - name: RetroCreatePlaylist
+    apps: ["retro music"]
+    complexity: 2.4
+    difficulty: medium
+    tags: []
+
+  - name: RetroSavePlaylist
+    apps: ["retro music"]
+    complexity: 5.0
+    difficulty: hard
+    tags: [long_sequence]

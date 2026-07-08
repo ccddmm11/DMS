@@ -1,0 +1,24 @@
+# 虚拟环境
+.venv/
+.venv_vllm/
+
+# 模型权重
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 实验结果（可选）
+results/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 系统文件
+.DS_Store
+Thumbs.db

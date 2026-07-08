@@ -1,0 +1,63 @@
+# Lean Android emulator image for AndroidWorld (DMS reproduction project).
+# Base image openjdk:18-jdk-slim was removed from Docker Hub, so we build on
+# eclipse-temurin:18-jdk (pre-loaded locally via skopeo since the docker
+# daemon's own registry proxy is broken on this host).
+FROM eclipse-temurin:18-jdk
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV http_proxy=${HTTP_PROXY}
+ENV https_proxy=${HTTPS_PROXY}
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /
+SHELL ["/bin/bash", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl sudo wget unzip bzip2 libdrm-dev libxkbcommon-dev libgbm-dev \
+    libasound-dev libnss3 libxcursor1 libpulse-dev libxshmfence-dev \
+    xauth xvfb x11vnc fluxbox wmctrl libdbus-glib-1-2 ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG ARCH="x86_64"
+ARG TARGET="google_apis"
+ARG API_LEVEL="33"
+ARG BUILD_TOOLS="33.0.0"
+ARG ANDROID_API_LEVEL="android-${API_LEVEL}"
+ARG ANDROID_APIS="${TARGET};${ARCH}"
+ARG EMULATOR_PACKAGE="system-images;${ANDROID_API_LEVEL};${ANDROID_APIS}"
+ARG PLATFORM_VERSION="platforms;${ANDROID_API_LEVEL}"
+ARG BUILD_TOOL="build-tools;${BUILD_TOOLS}"
+ARG ANDROID_CMD="commandlinetools-linux-11076708_latest.zip"
+ARG ANDROID_SDK_PACKAGES="${EMULATOR_PACKAGE} ${PLATFORM_VERSION} ${BUILD_TOOL} platform-tools emulator"
+
+ENV ANDROID_SDK_ROOT=/opt/android
+ENV PATH="$PATH:$ANDROID_SDK_ROOT/cmdline-tools/tools:$ANDROID_SDK_ROOT/cmdline-tools/tools/bin:$ANDROID_SDK_ROOT/emulator:$ANDROID_SDK_ROOT/tools/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}"
+ENV DOCKER="true"
+
+RUN wget -q https://dl.google.com/android/repository/${ANDROID_CMD} -P /tmp && \
+    unzip -q -d $ANDROID_SDK_ROOT /tmp/$ANDROID_CMD && \
+    mkdir -p $ANDROID_SDK_ROOT/cmdline-tools/tools && cd $ANDROID_SDK_ROOT/cmdline-tools && mv NOTICE.txt source.properties bin lib tools/ && \
+    cd $ANDROID_SDK_ROOT/cmdline-tools/tools && ls
+
+RUN yes Y | sdkmanager --licenses > /dev/null
+RUN yes Y | sdkmanager --verbose --no_https ${ANDROID_SDK_PACKAGES}
+
+ARG EMULATOR_NAME="Pixel_6_API_33"
+ARG EMULATOR_DEVICE="pixel_6"
+ENV EMULATOR_NAME=$EMULATOR_NAME
+ENV DEVICE_NAME=$EMULATOR_DEVICE
+RUN echo "no" | avdmanager --verbose create avd --force --name "${EMULATOR_NAME}" --device "${EMULATOR_DEVICE}" --package "${EMULATOR_PACKAGE}"
+
+COPY docker_setup/start_emu_headless.sh /docker_setup/start_emu_headless.sh
+RUN chmod a+x /docker_setup/start_emu_headless.sh
+
+WORKDIR /
+# CONSOLE_PORT/GRPC_PORT are read at container *runtime* (not baked into the
+# image) so the SAME image can back multiple parallel emulator containers,
+# each on its own port pair (DMS reproduction project eval harness); see
+# docker_setup/start_emu_headless.sh. Defaults (5554/8554) match the
+# original single-instance AndroidWorld convention.
+ENV CONSOLE_PORT=5554
+ENV GRPC_PORT=8554
+ENTRYPOINT ["/bin/bash", "-c", "/docker_setup/start_emu_headless.sh && adb -s emulator-${CONSOLE_PORT} root && tail -f /dev/null"]
