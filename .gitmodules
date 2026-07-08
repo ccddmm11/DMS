@@ -1,0 +1,3 @@
+[submodule "android_world"]
+	path = android_world
+	url = https://github.com/google-research/android_world.git
