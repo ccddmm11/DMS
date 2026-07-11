@@ -112,7 +112,10 @@ class Verifier:
 
     if not raw_response or is_safe is False:  # pylint: disable=g-bool-id-comparison
       return VerifierOutput(
-          verified_success=default_on_parse_failure,
+          # Transport/safety failures are not evidence of completion. The
+          # permissive fallback below is retained only for malformed but
+          # otherwise successful model responses.
+          verified_success=False,
           reason="Verifier LLM call failed or was blocked.",
           raw_text=raw_text,
           raw_response=raw_response,

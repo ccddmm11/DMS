@@ -28,9 +28,16 @@ class QwenVLConfig:
   temperature: float = 0.0
   top_p: float = 0.9
   max_tokens: int = 1000
-  max_retry: int = 3
+  # Evaluation workers must make forward progress if the local vLLM queue is
+  # saturated. A second identical multimodal request only extends a stalled
+  # cell and can prevent resume-safe records from being written.
+  max_retry: int = 1
   retry_waiting_seconds: float = 5.0
-  request_timeout: float = 120.0
+  # A bounded failure is preferable to leaving a long experiment worker
+  # blocked for many minutes on one overloaded vLLM request. This is a
+  # per-attempt requests timeout; with max_retry=1 it is also the upper bound
+  # for one inference call.
+  request_timeout: float = 45.0
 
 
 class QwenVLWrapper(infer.LlmWrapper, infer.MultimodalLlmWrapper):

@@ -36,9 +36,14 @@ from src.eval.task_suite import TaskSpec, TaskSuite
 
 logger = logging.getLogger("dms_eval")
 
-# AndroidWorld's own convention (`suite_utils._allocate_step_budget`).
+# Step budget per episode. We keep AndroidWorld's complexity-proportional
+# scaling (`suite_utils._allocate_step_budget`), but raise the floor from 10
+# to 30: with a 7B backbone most of the budget is spent recovering from
+# navigation/grounding mistakes, and a 10-step floor left no room to actually
+# finish even simple multi-hop tasks (matching the peer reproductions, which
+# use a fixed 30-step budget).
 STEPS_PER_COMPLEXITY_UNIT = 10
-MIN_STEPS = 10
+MIN_STEPS = 30
 
 
 @dataclasses.dataclass
@@ -128,21 +133,39 @@ def _run_one_episode(
   success = False
   agent_done = False
   atomic_steps = 0
-  usage_before = _usage_dict(agent)
 
   try:
     task.initialize_task(env)
-    agent.start_new_task(spec.name)
+    agent.start_new_task(spec.name, spec.apps)
+
+    # #1: use AndroidWorld's ground-truth evaluator to END the episode as soon
+    # as the task is actually done, instead of relying on the agent's Planner
+    # to self-declare completion (which a 7B Planner almost never does -- see
+    # results/debug/zero_success_rate_diagnosis.md). `run_episode` calls this
+    # after every atomic step and terminates with done=True on a truthy value.
+    # This is an engineering deviation from the paper's Verifier-driven
+    # completion, adopted (like the peer reproductions) to make the metric
+    # reflect real task success rather than the agent's self-report.
+    def _evaluator_termination_fn(_env: interface.AsyncEnv) -> float:
+      try:
+        return 1.0 if task.is_successful(_env) == 1 else 0.0
+      except Exception:  # pylint: disable=broad-exception-caught
+        return 0.0
+
     episode_result = run_episode(
         goal=task.goal,
         agent=agent,
         max_n_steps=max_steps,
         start_on_home_screen=getattr(task, "start_on_home_screen", False),
+        termination_fn=_evaluator_termination_fn,
     )
+    # `agent_done` now means "episode ended early" (agent self-declared OR the
+    # evaluator fired), while `success` is the ground-truth evaluator verdict
+    # and is no longer gated on the agent declaring done.
     agent_done = bool(episode_result.done)
     atomic_steps = len(episode_result.step_data.get("phase", [])) if episode_result.step_data else 0
     task_success_signal = task.is_successful(env)
-    success = agent_done and task_success_signal == 1
+    success = task_success_signal == 1
   except Exception as e:  # pylint: disable=broad-exception-caught
     error_msg = f"{type(e).__name__}: {e}"
     logger.exception("[%s] round=%d task=%s CRASHED: %s", config.condition, round_idx, spec.name, e)
@@ -163,12 +186,14 @@ def _run_one_episode(
   except Exception as e:  # pylint: disable=broad-exception-caught
     logger.exception("[%s] tear_down failed: %s", config.condition, e)
 
-  usage_after = _usage_dict(agent)
-  usage_delta = {
-      k: usage_after.get(k, 0) - usage_before.get(k, 0)
-      for k in usage_after
-      if isinstance(usage_after.get(k), (int, float))
-  }
+  # NOTE: `agent.usage` is NOT a running total -- `agent.reset()` (called as
+  # the first thing inside `episode_runner.run_episode()`, i.e. already
+  # executed by the time we get here, including on the exception path)
+  # always replaces it with a fresh, zeroed usage object for this episode.
+  # So no before/after delta is needed (or correct -- a delta would instead
+  # subtract the *previous* episode's final totals from THIS episode's,
+  # producing nonsensical negative counts).
+  usage_delta = _usage_dict(agent)
   bank = getattr(agent, "bank", None)
   memory_bank_size_after = len(bank) if bank is not None else None
 
@@ -203,6 +228,12 @@ def _run_one_episode(
       retrieval_hits=usage_delta.get("retrieval_hits"),
       replay_attempts=usage_delta.get("replay_attempts"),
       replay_successes=usage_delta.get("replay_successes"),
+      subtask_replay_attempts=usage_delta.get("replay_attempts"),
+      subtask_replay_verified=usage_delta.get("replay_successes"),
+      episode_replay_attempted=bool(usage_delta.get("replay_attempts", 0)),
+      episode_success_after_replay=(
+          bool(success) if usage_delta.get("replay_attempts", 0) else None
+      ),
       replayed_actions_executed=usage_delta.get("replayed_actions_executed"),
       fresh_actions_executed=usage_delta.get("atomic_actions_executed"),
       memory_reuse_rate=mrr,

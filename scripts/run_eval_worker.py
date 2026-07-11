@@ -19,6 +19,7 @@ testing a single condition:
 """
 
 import argparse
+import faulthandler
 import logging
 import os
 import sys
@@ -82,6 +83,12 @@ def main() -> int:
   parser.add_argument("--memory_root", default=os.path.join(_REPO_ROOT, "results", "memory_stores"))
   parser.add_argument("--vllm_base_url", default="http://localhost:8000/v1")
   parser.add_argument("--log_file", default=None)
+  parser.add_argument(
+      "--watchdog_seconds",
+      type=float,
+      default=0.0,
+      help="Dump all Python thread stacks at this interval while debugging a stall.",
+  )
   args = parser.parse_args()
 
   handlers = [logging.StreamHandler(sys.stdout)]
@@ -95,6 +102,14 @@ def main() -> int:
       force=True,
   )
   logger = logging.getLogger("dms_eval")
+  if args.watchdog_seconds > 0:
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(
+        args.watchdog_seconds, repeat=True
+    )
+    logger.warning(
+        "Enabled Python stack watchdog every %.1fs.", args.watchdog_seconds
+    )
   logger.info("Worker starting: condition=%s console_port=%d grpc_port=%d rounds=%d",
               args.condition, args.console_port, args.grpc_port, args.rounds)
 
@@ -128,6 +143,8 @@ def main() -> int:
   try:
     run_condition(env, agent_factory, suite, config)
   finally:
+    if args.watchdog_seconds > 0:
+      faulthandler.cancel_dump_traceback_later()
     env.close()
 
   logger.info("Worker finished: condition=%s output=%s", args.condition, args.output_jsonl)

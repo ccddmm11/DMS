@@ -62,10 +62,12 @@ PLANNER_PROMPT_TEMPLATE = (
     " actions to fulfill it.\n\n"
     "**Inputs you receive:**\n"
     "1. The user's overall goal.\n"
-    "2. The current device state: a screenshot (with numeric index marks on"
+    "2. The task's declared target apps, supplied by the AndroidWorld task"
+    " suite. This is trusted task metadata, not a suggestion from the user.\n"
+    "3. The current device state: a screenshot (with numeric index marks on"
     " visible UI elements) and a JSON list of detailed information for those"
     " UI elements.\n"
-    "3. Complete task history: a record of ALL sub-plans that have been"
+    "4. Complete task history: a record of ALL sub-plans that have been"
     " completed or failed so far in this session. This history persists"
     " across replanning cycles and is never lost.\n\n"
     "**Your task:** Given the goal, current state and task history, devise"
@@ -83,6 +85,55 @@ PLANNER_PROMPT_TEMPLATE = (
     ' (use "None" if not critical, e.g. for the very first step of a new'
     " sequence).\n"
     '  - "goal": the concrete, single functional objective for this step.\n\n'
+    "**IMPORTANT -- sub-goals must be actionable, not just observational:**"
+    " Always phrase each \"goal\" as a concrete UI INTERACTION to perform"
+    ' (e.g. "click the \'Network & internet\' option", "toggle the Wi-Fi'
+    ' switch on", "type \'foo\' into the search field"), never as a passive'
+    ' "find/locate/check if X is visible" goal on its own -- if the target'
+    " is already visible, the very next sub-goal should be to act on it"
+    " (click/toggle/type), not to merely confirm it is visible. Check the"
+    " task history below: if it shows a sub-goal was already marked"
+    " COMPLETED but the CURRENT screen still looks basically the same as"
+    " before AND the overall goal is still not achieved, that means no real"
+    " progress happened -- do NOT repeat the same (or a near-identical)"
+    " sub-goal again. Instead, identify the next concrete interaction"
+    " needed and issue THAT.\n\n"
+    "**Target-app scope:** At the beginning of a task, navigate into one of"
+    " the declared target apps before attempting in-app work. Do not"
+    " substitute a semantically related but undeclared app (for example,"
+    " Photos is not a substitute for Camera when taking a photo). If the"
+    " task history says a completion candidate was rejected by the"
+    " evaluator, the overall goal is definitely NOT complete: identify the"
+    " missing state transition from the current screen and return a concrete"
+    " recovery interaction.\n\n"
+    "If task history says a previous overall-completion declaration was not"
+    " accepted by the evaluator, treat the overall goal as still in progress:"
+    ' set "done": false and provide a concrete, state-grounded sub-plan'
+    " instead of repeating the declaration.\n\n"
+    "**System-toggle grounding:** For goals such as turning Wi-Fi, Bluetooth,"
+    " airplane mode, or a similar system setting on/off, NEVER declare the"
+    " overall goal complete merely because the Quick Settings shade is open,"
+    " a generic unlabeled control says \"On\"/\"Off\", the status bar shows a"
+    " signal icon, or the screen says \"No internet\". Those do not establish"
+    " the requested setting's state. Declare completion only after a"
+    " Wi-Fi/Bluetooth/etc. control explicitly identified by its own label"
+    " shows the requested checked/on state. If that evidence is absent, set"
+    ' "done": false and issue a concrete next interaction; from the launcher,'
+    ' prefer "open the Settings app", then navigate to the named setting.'
+    "\n\n"
+    "**IMPORTANT -- never retry a FAILED sub-goal verbatim, switch"
+    " strategy instead:** If the task history shows a sub-goal was marked"
+    " FAILED or infeasible (especially one noting it was \"Stalled\" or"
+    " declared infeasible with zero actions), that EXACT approach does not"
+    " work -- issuing the same or a near-identical goal again will fail"
+    " the same way. You MUST pick a genuinely different strategy for your"
+    " next sub-plan, for example: if scrolling failed, try the opposite"
+    " scroll direction, or stop scrolling and look for a search/menu/back"
+    " button instead; if navigating through one screen path stalled,"
+    " restart from the home screen or app drawer and take a different"
+    " route (e.g. open the Settings app directly, use its search bar, or"
+    " use the Quick Settings panel) instead of repeating the same"
+    " navigation step.\n\n"
     "**Termination:** After your planned steps are executed, you will be"
     " invoked again with the new device state. At that point:\n"
     '  - If the OVERALL user goal is now complete, set "done": true and'
@@ -98,6 +149,7 @@ PLANNER_PROMPT_TEMPLATE = (
     ' "message": "<short summary/answer/reason>", "sub_plans":'
     ' [{{"precondition": "...", "goal": "..."}}, ...]}}\n\n'
     "The current user goal/request is: {goal}\n\n"
+    "Declared target app(s) for this task: {task_apps}\n\n"
     "Here is the complete task history so far (empty if this is the first"
     " planning cycle):\n{history}\n\n"
     "Here is a list of detailed information for the UI elements visible in"
@@ -115,13 +167,18 @@ class Planner:
     self.llm = llm
 
   def _build_prompt(
-      self, goal: str, history: list[str], ui_elements: str
+      self,
+      goal: str,
+      history: list[str],
+      ui_elements: str,
+      task_apps: Optional[list[str]] = None,
   ) -> str:
     history_str = (
         "\n".join(history) if history else "No sub-plans attempted yet."
     )
     return PLANNER_PROMPT_TEMPLATE.format(
         goal=goal,
+        task_apps=", ".join(task_apps) if task_apps else "Not specified",
         history=history_str,
         ui_elements=ui_elements if ui_elements else "Not available",
     )
@@ -132,9 +189,10 @@ class Planner:
       history: list[str],
       ui_elements: str,
       screenshots: list[np.ndarray],
+      task_apps: Optional[list[str]] = None,
   ) -> PlannerOutput:
     """Calls the Planner LLM and parses its structured decision."""
-    prompt = self._build_prompt(goal, history, ui_elements)
+    prompt = self._build_prompt(goal, history, ui_elements, task_apps)
     raw_text, is_safe, raw_response = self.llm.predict_mm(prompt, screenshots)
 
     if not raw_response or is_safe is False:  # pylint: disable=g-bool-id-comparison

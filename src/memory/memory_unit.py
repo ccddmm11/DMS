@@ -38,6 +38,7 @@ class TrajectoryStep:
   reason: str
   action: dict[str, Any]  # `json_action.JSONAction.as_dict()`-compatible.
   target_element_desc: Optional[str] = None
+  state_signature: Optional[str] = None
 
   def to_dict(self) -> dict[str, Any]:
     return dataclasses.asdict(self)
@@ -48,6 +49,7 @@ class TrajectoryStep:
         reason=d.get("reason", ""),
         action=d.get("action", {}),
         target_element_desc=d.get("target_element_desc"),
+        state_signature=d.get("state_signature"),
     )
 
 

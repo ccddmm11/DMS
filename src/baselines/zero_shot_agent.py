@@ -37,6 +37,10 @@ from android_world.agents import infer
 from android_world.env import interface
 from android_world.env import json_action
 
+from src.agent import action_utils
+from src.agent import app_intent
+from src.agent import loop_guard
+from src.agent import system_ui_intent
 from src.agent import ui_utils
 from src.agent.actor import Actor
 from src.agent.planner import Planner
@@ -95,6 +99,9 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
     self.max_actor_steps_per_subtask = max_actor_steps_per_subtask
     self.wait_after_action_seconds = wait_after_action_seconds
     self.additional_guidelines = None  # kept for API parity with M3A/T3A.
+    self._repetition_breaker = loop_guard.RepetitionBreaker()
+    self._current_task_name: Optional[str] = None
+    self._task_apps: list[str] = []
     self._reset_episode_state()
 
   # -- API parity with M3A/T3A -----------------------------------------
@@ -110,8 +117,11 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
   # call `start_new_task`/`finalize_task` uniformly across all three
   # conditions without special-casing Baseline A (which has no memory and
   # therefore nothing to tick/regulate). --------------------------------
-  def start_new_task(self, task_name: Optional[str] = None) -> None:
-    del task_name
+  def start_new_task(
+      self, task_name: Optional[str] = None, task_apps: Optional[list[str]] = None
+  ) -> None:
+    self._current_task_name = task_name
+    self._task_apps = list(task_apps or [])
 
   def finalize_task(self, task_succeeded: bool) -> None:
     del task_succeeded
@@ -125,14 +135,40 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
     self.sub_task_step_count = 0
     self.replan_cycles = 0
     self.usage = UsageStats()
+    self._repetition_breaker.reset()
+    self._task_navigation_started = False
+    self._planner_completion_rejections = 0
+    self._system_toggle_route_labels: list[str] = []
 
   def _finish_sub_task(self, success: bool, reason: str) -> None:
     assert self.current_sub_task is not None
+    actions_taken = max(0, len(self.sub_task_history) - 1)
+    if success and self._repetition_breaker.record_and_check(
+        self.current_sub_task.goal, actions_taken
+    ):
+      success = False
+      reason = (
+          "Stalled: repeated the same zero-action sub-goal completion"
+          f" {self._repetition_breaker.max_repeats}x in a row without any"
+          " real interaction; forcing failure to break the loop and force"
+          " a genuine replan."
+      )
     tag = "COMPLETED" if success else "FAILED"
     self.task_history.append(
         f"Sub-task [{self.current_sub_task.as_prompt_str()}] {tag}:"
         f" {reason}"
     )
+    if success:
+      # `sub_task_history` still holds this cycle's entries at this point
+      # (reset happens further below) -- exactly 1 entry means it was JUST
+      # the zero-action "declared complete" line (see
+      # `loop_guard.annotate_zero_action_completion`), i.e. no real
+      # interaction happened this sub-task.
+      stall_warning = loop_guard.stall_warning_if_zero_action(
+          self.current_sub_task.goal, actions_taken=actions_taken
+      )
+      if stall_warning:
+        self.task_history.append(stall_warning)
     self.current_sub_task = None
     if not success:
       # Algorithm 1: discard the rest of this plan cycle and force a full
@@ -146,12 +182,213 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
     # Else: queue is also empty -> next step() call re-invokes the Planner,
     # which gets the chance to declare overall task completion.
 
-  def _verify_and_finish_sub_task(self, final_screenshot) -> None:
+  def _advance_after_fast_path(self, msg: str) -> None:
+    """Marks the current sub-task COMPLETED via a deterministic fast path
+    (no memory, Verifier, or repetition-breaker accounting)."""
+    assert self.current_sub_task is not None
+    self.task_history.append(
+        f"Sub-task [{self.current_sub_task.as_prompt_str()}] COMPLETED: {msg}"
+    )
+    self.current_sub_task = None
+    if self.sub_plan_queue:
+      self.current_sub_task = self.sub_plan_queue.pop(0)
+      self.sub_task_history = []
+      self.sub_task_step_count = 0
+
+  def _maybe_open_app_fast_path(
+      self, step_data: dict[str, Any]
+  ) -> Optional[base_agent.AgentInteractionResult]:
+    """#3: deterministic handling of an explicit "open <app>" sub-goal at the
+    start of a sub-task. Returns an AgentInteractionResult to short-circuit
+    this `step()` call, or None to proceed with the normal Actor."""
+    if self.sub_task_step_count != 0:
+      return None
+    decision = app_intent.open_app_fast_path_decision(
+        self.env, self.current_sub_task.goal
+    )
+    if decision is None:
+      return None
+    kind, app_name = decision
+    step_data["phase"] = "open_app_fast_path"
+    step_data["sub_task"] = self.current_sub_task.to_dict()
+    if kind == "already":
+      step_data["action_reason"] = f"Already in the '{app_name}' app."
+      self._advance_after_fast_path(
+          f"already in the '{app_name}' app; no navigation needed."
+      )
+      return base_agent.AgentInteractionResult(False, step_data)
+    # kind == "open"
+    try:
+      self.env.execute_action(
+          json_action.JSONAction(action_type="open_app", app_name=app_name)
+      )
+      self.usage.atomic_actions_executed += 1
+      step_data["action_reason"] = f"Deterministic open_app({app_name})."
+      time.sleep(self.wait_after_action_seconds)
+      self._advance_after_fast_path(
+          f"opened the '{app_name}' app directly (deterministic fast path)."
+      )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      self._finish_sub_task(
+          False, f"could not open app '{app_name}' directly ({e})."
+      )
+    return base_agent.AgentInteractionResult(False, step_data)
+
+  def _maybe_open_initial_task_app_fast_path(
+      self, step_data: dict[str, Any]
+  ) -> Optional[base_agent.AgentInteractionResult]:
+    """Uses task-suite app metadata only for the launcher-to-app prefix."""
+    decision = app_intent.initial_task_app_fast_path_decision(
+        self.env, self._task_apps, self._task_navigation_started
+    )
+    if decision is None:
+      return None
+    kind, app_name = decision
+    self._task_navigation_started = True
+    step_data["phase"] = "initial_task_app_fast_path"
+    if kind == "already":
+      step_data["action_reason"] = f"Already in declared task app '{app_name}'."
+      self.task_history.append(
+          f"[Task setup] Already in declared target app '{app_name}'."
+      )
+      return base_agent.AgentInteractionResult(False, step_data)
+    try:
+      self.env.execute_action(
+          json_action.JSONAction(action_type="open_app", app_name=app_name)
+      )
+      self.usage.atomic_actions_executed += 1
+      step_data["action_reason"] = (
+          f"Opened declared target app '{app_name}' from task-suite metadata."
+      )
+      self.task_history.append(
+          f"[Task setup] Opened declared target app '{app_name}' directly."
+      )
+      time.sleep(self.wait_after_action_seconds)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      self.task_history.append(
+          f"[Task setup] Could not open declared target app '{app_name}': {e}."
+      )
+    return base_agent.AgentInteractionResult(False, step_data)
+
+  def _maybe_open_quick_settings_fast_path(
+      self, step_data: dict[str, Any], task_goal: str
+  ) -> Optional[base_agent.AgentInteractionResult]:
+    """Opens Quick Settings for a narrow launcher/system-toggle gesture."""
+    if self.sub_task_step_count != 0:
+      return None
+    decision = system_ui_intent.quick_settings_fast_path_decision(
+        self.env, self.current_sub_task.goal, task_goal
+    )
+    if decision is None:
+      return None
+    step_data["phase"] = "system_navigation_fast_path"
+    step_data["sub_task"] = self.current_sub_task.to_dict()
+    try:
+      if decision == "open_settings":
+        self.env.execute_action(
+            json_action.JSONAction(action_type="open_app", app_name="Settings")
+        )
+        progress_message = "opened Settings directly for a system-toggle task."
+        action_reason = (
+            "Deterministic open_app(Settings) for a launcher system-toggle"
+            " task; Settings exposes labeled controls more reliably than"
+            " generic Quick Settings switches."
+        )
+      else:
+        self.env.execute_action(
+            json_action.JSONAction(action_type="swipe", direction="down")
+        )
+        progress_message = (
+            "opened Quick Settings with a deterministic top-edge pull-down."
+        )
+        action_reason = (
+            "Deterministic top-edge pull-down to open Quick Settings."
+        )
+      self.usage.atomic_actions_executed += 1
+      step_data["action_reason"] = action_reason
+      time.sleep(self.wait_after_action_seconds)
+      self._advance_after_fast_path(progress_message)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      self._finish_sub_task(
+          False, f"could not open Quick Settings directly ({e})."
+      )
+    return base_agent.AgentInteractionResult(False, step_data)
+
+  def _maybe_advance_system_toggle_fast_path(
+      self,
+      step_data: dict[str, Any],
+      task_goal: str,
+      ui_elements,
+      logical_screen_size: tuple[int, int],
+  ) -> Optional[base_agent.AgentInteractionResult]:
+    decision = system_ui_intent.next_labeled_system_toggle_action(
+        self.env, task_goal, ui_elements, logical_screen_size,
+        tuple(self._system_toggle_route_labels),
+    )
+    if decision is None:
+      return None
+    action_dict, label = decision
+    action_dict, _ = action_utils.reground_action(
+        action_dict, ui_elements, label, f"click '{label}'",
+        logical_screen_size,
+    )
+    if action_dict.get("index") == -1:
+      fallback_index = ui_utils.find_element_by_description(
+          ui_elements, label, logical_screen_size
+      )
+      if fallback_index is not None:
+        action_dict["index"] = fallback_index
+    step_data["phase"] = "system_toggle_fast_path"
+    try:
+      self.env.execute_action(json_action.JSONAction(**action_dict))
+      self.usage.atomic_actions_executed += 1
+      step_data["action_reason"] = (
+          f"Clicked labeled Android Settings route '{label}' for system toggle."
+      )
+      self.task_history.append(
+          f"[System toggle setup] Clicked labeled Settings target '{label}'."
+      )
+      self._system_toggle_route_labels.append(label)
+      time.sleep(self.wait_after_action_seconds)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      self.task_history.append(
+          f"[System toggle setup] Could not click Settings target '{label}': {e}."
+      )
+    return base_agent.AgentInteractionResult(False, step_data)
+
+  def _verify_and_finish_sub_task(
+      self, final_screenshot, observation_degraded: bool = False
+  ) -> None:
+    if observation_degraded:
+      # See `ui_utils.get_robust_state`: the Actor was effectively blind
+      # (degenerate a11y tree), so its claimed history is not trustworthy
+      # grounding. Fail closed rather than let the Verifier's default
+      # History-First trust rubber-stamp a hallucinated success.
+      self._finish_sub_task(
+          False,
+          "Skipped verification: environment observation was degraded"
+          " (a11y tree still empty after retries).",
+      )
+      return
     self.usage.verifier_calls += 1
     verifier_output = self.verifier.verify(
         self.current_sub_task.goal, self.sub_task_history, final_screenshot
     )
     self.usage.add(verifier_output.raw_response)
+    # #6: veto a zero-action "success" on an interaction-implying sub-goal
+    # (the "found it = done" exploit) so it fails on first occurrence.
+    actions_taken = max(0, len(self.sub_task_history) - 1)
+    if (
+        verifier_output.verified_success
+        and actions_taken == 0
+        and loop_guard.goal_requires_interaction(self.current_sub_task.goal)
+    ):
+      self._finish_sub_task(
+          False,
+          "Rejected zero-action completion: the sub-goal requires a concrete"
+          " UI interaction, but no action was performed.",
+      )
+      return
     self._finish_sub_task(verifier_output.verified_success,
                            verifier_output.reason)
 
@@ -166,7 +403,8 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
         "raw_screenshot": None,
     }
 
-    state = self.get_post_transition_state()
+    state, state_degraded = ui_utils.get_robust_state(self.env)
+    step_data["state_degraded"] = state_degraded
     logical_screen_size = self.env.logical_screen_size
     orientation = self.env.orientation
     physical_frame_boundary = self.env.physical_frame_boundary
@@ -184,6 +422,17 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
         orientation,
     )
 
+    initial_task_app_result = self._maybe_open_initial_task_app_fast_path(
+        step_data
+    )
+    if initial_task_app_result is not None:
+      return initial_task_app_result
+    system_toggle_result = self._maybe_advance_system_toggle_fast_path(
+        step_data, goal, ui_elements, logical_screen_size
+    )
+    if system_toggle_result is not None:
+      return system_toggle_result
+
     # --- Planning phase: only entered when there is no active sub-task. ---
     if self.current_sub_task is None:
       step_data["phase"] = "plan"
@@ -191,13 +440,37 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
       self.replan_cycles += 1
       planner_output = self.planner.plan(
           goal, self.task_history, ui_elements_str,
-          [raw_screenshot, som_screenshot],
+          [raw_screenshot, som_screenshot], task_apps=self._task_apps,
       )
       self.usage.add(planner_output.raw_response)
       step_data["planner_message"] = planner_output.message
 
-      if planner_output.done:
+      if not planner_output.parse_ok and planner_output.raw_response is None:
+        # Retrying the identical failed VLM request on every outer step only
+        # turns a transient server outage into a stalled evaluation worker.
+        self.task_history.append(
+            "[Planner transport failure] Ending episode for forward progress:"
+            f" {planner_output.message}"
+        )
         return base_agent.AgentInteractionResult(True, step_data)
+
+      if planner_output.done:
+        # The evaluation runner supplies AndroidWorld's ground-truth
+        # termination callback. A 7B Planner's self-report is not reliable
+        # enough to end an episode: it can mistake an unlabeled system tile
+        # for an enabled setting (e.g. SystemWifiTurnOn). Keep the episode
+        # alive so the evaluator alone can terminate a real success.
+        self._planner_completion_rejections += 1
+        self.task_history.append(
+            "[Planner completion rejected] AndroidWorld evaluator has not"
+            f" satisfied goal={goal!r}; declared_target_apps={self._task_apps};"
+            f" foreground_package={app_intent.current_app_package(self.env)!r};"
+            f" completion_message={planner_output.message!r};"
+            f" rejection_count={self._planner_completion_rejections}."
+            " Return a concrete recovery interaction that changes the missing"
+            " task state; do not repeat completion."
+        )
+        return base_agent.AgentInteractionResult(False, step_data)
 
       if not planner_output.sub_plans:
         self.task_history.append(
@@ -210,6 +483,16 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
       self.current_sub_task = self.sub_plan_queue.pop(0)
       self.sub_task_history = []
       self.sub_task_step_count = 0
+
+    # --- #3: deterministic open-app fast path (no LLM) before the Actor. ---
+    fast_path_result = self._maybe_open_app_fast_path(step_data)
+    if fast_path_result is not None:
+      return fast_path_result
+    fast_path_result = self._maybe_open_quick_settings_fast_path(
+        step_data, goal
+    )
+    if fast_path_result is not None:
+      return fast_path_result
 
     # --- Execution phase: one Actor-generated atomic action. ---
     step_data["phase"] = "act"
@@ -240,9 +523,19 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
     step_data["action_reason"] = reason
 
     try:
-      converted_action = json_action.JSONAction(
-          **agent_utils.extract_json(action_str)
+      # #4: sanitize recoverable schema noise and re-ground the pointing
+      # index to the target the Actor named before building the action.
+      action_dict = action_utils.normalize_action_dict(
+          agent_utils.extract_json(action_str)
       )
+      action_dict, reground_note = action_utils.reground_action(
+          action_dict, ui_elements, reason,
+          self.current_sub_task.goal, logical_screen_size,
+      )
+      if reground_note:
+        reason = f"{reason} [{reground_note}]"
+        step_data["action_reason"] = reason
+      converted_action = json_action.JSONAction(**action_dict)
       step_data["action_output_json"] = converted_action
     except Exception as e:  # pylint: disable=broad-exception-caught
       self.sub_task_history.append(
@@ -257,12 +550,29 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
 
     # Sub-task-level status declaration: intercepted, never sent to `env`.
     if converted_action.action_type == "status":
-      self.sub_task_history.append(
-          f"Reason: {reason} Action: declared sub-task"
-          f" {converted_action.goal_status}."
+      if not self.sub_task_history:
+        self.sub_task_history.append(
+            loop_guard.annotate_zero_action_completion(
+                reason, converted_action.goal_status
+            )
+        )
+      else:
+        self.sub_task_history.append(
+            f"Reason: {reason} Action: declared sub-task"
+            f" {converted_action.goal_status}."
+        )
+      # `infeasible` is the Actor reporting that it could not execute this
+      # sub-task. It must force PlanFailed immediately, not be presented to
+      # the History-First Verifier as evidence that the goal was achieved.
+      if converted_action.goal_status == "infeasible":
+        self._finish_sub_task(
+            False, f"Actor declared sub-task infeasible: {reason}"
+        )
+        return base_agent.AgentInteractionResult(False, step_data)
+      after_state, after_degraded = ui_utils.get_robust_state(self.env)
+      self._verify_and_finish_sub_task(
+          after_state.pixels, observation_degraded=after_degraded
       )
-      after_state = self.env.get_state(wait_to_stabilize=False)
-      self._verify_and_finish_sub_task(after_state.pixels)
       return base_agent.AgentInteractionResult(False, step_data)
 
     num_ui_elements = len(ui_elements)
@@ -295,7 +605,9 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
     time.sleep(self.wait_after_action_seconds)
 
     if self.sub_task_step_count >= self.max_actor_steps_per_subtask:
-      after_state = self.env.get_state(wait_to_stabilize=False)
-      self._verify_and_finish_sub_task(after_state.pixels)
+      after_state, after_degraded = ui_utils.get_robust_state(self.env)
+      self._verify_and_finish_sub_task(
+          after_state.pixels, observation_degraded=after_degraded
+      )
 
     return base_agent.AgentInteractionResult(False, step_data)

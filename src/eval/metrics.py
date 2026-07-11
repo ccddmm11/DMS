@@ -6,13 +6,24 @@
 # `load_completed_cells` lets a restarted worker skip everything already
 # recorded (resume-safe).
 #
-# `aggregate` turns a flat list of `EpisodeRecord` into the per
+# `aggregate_by_round` turns a flat list of `EpisodeRecord` into the per
 # (condition, round) summary table the report needs:
-#   - SR   (Success Rate):            mean(success) over that cell's episodes
-#   - SRR  (Successful Replay Rate):  replay_successes / replay_attempts
-#   - MRR  (Memory Reuse Rate):       replayed_actions / (replayed+fresh actions)
-#   - avg atomic steps, avg tokens (prompt+completion), avg wall-clock
-#   - memory bank size at the end of that round (last episode's snapshot)
+#   - SR    (Success Rate, paper Appendix E.1):
+#       mean(success) over that cell's episodes.
+#   - subtask_replay_verified_rate (NOT the paper's SRR): how often a
+#       replayed sub-task passed the LLM Verifier.
+#   - episode_success_after_replay_rate: ground-truth AndroidWorld task
+#       success among episodes that attempted at least one replay.
+#   - MRR   (Memory Reuse Rate, paper Appendix E.3):
+#       sum(replayed_actions) / sum(replayed+fresh actions) over that cell.
+#   - avg atomic steps, avg tokens (prompt+completion), avg wall-clock.
+#   - memory bank size at the end of that round (last episode's snapshot).
+#
+# `success_retention_rate` (SRR, paper Appendix E.2) is a DIFFERENT,
+# temporal-sequence metric -- P(x_{t+1}=1 | x_t=1) pooled over every task's
+# across-round outcome sequence for one condition -- and is computed
+# separately by `aggregate_srr_by_condition` (it needs the FULL multi-round
+# history per task, not a single (condition, round) cell).
 
 from __future__ import annotations
 
@@ -55,6 +66,12 @@ class EpisodeRecord:
   retrieval_hits: Optional[int] = None
   replay_attempts: Optional[int] = None
   replay_successes: Optional[int] = None
+  # Explicit labels prevent a verifier-approved replay from being confused
+  # with end-to-end task success.
+  subtask_replay_attempts: Optional[int] = None
+  subtask_replay_verified: Optional[int] = None
+  episode_replay_attempted: Optional[bool] = None
+  episode_success_after_replay: Optional[bool] = None
   replayed_actions_executed: Optional[int] = None
   fresh_actions_executed: Optional[int] = None
   memory_reuse_rate: Optional[float] = None
@@ -115,8 +132,19 @@ def aggregate_by_round(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     n = len(rows)
     success_count = sum(1 for r in rows if r["success"])
     total_tokens = [r["prompt_tokens"] + r["completion_tokens"] for r in rows]
-    total_replay_attempts = sum(r.get("replay_attempts") or 0 for r in rows)
-    total_replay_successes = sum(r.get("replay_successes") or 0 for r in rows)
+    total_subtask_replay_attempts = sum(
+        r.get("subtask_replay_attempts", r.get("replay_attempts")) or 0
+        for r in rows
+    )
+    total_subtask_replay_verified = sum(
+        r.get("subtask_replay_verified", r.get("replay_successes")) or 0
+        for r in rows
+    )
+    replayed_episode_outcomes = [
+        r.get("episode_success_after_replay", r.get("success"))
+        for r in rows
+        if r.get("episode_replay_attempted", (r.get("replay_attempts") or 0) > 0)
+    ]
     total_replayed_actions = sum(r.get("replayed_actions_executed") or 0 for r in rows)
     total_fresh_actions = sum(r.get("fresh_actions_executed") or 0 for r in rows)
     total_actions = total_replayed_actions + total_fresh_actions
@@ -130,7 +158,14 @@ def aggregate_by_round(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "round_idx": round_idx,
         "n_episodes": n,
         "success_rate": success_count / n if n else None,
-        "successful_replay_rate": _safe_div(total_replay_successes, total_replay_attempts),
+        "subtask_replay_verified_rate": _safe_div(
+            total_subtask_replay_verified, total_subtask_replay_attempts
+        ),
+        "episode_success_after_replay_rate": (
+            sum(bool(v) for v in replayed_episode_outcomes)
+            / len(replayed_episode_outcomes)
+            if replayed_episode_outcomes else None
+        ),
         "memory_reuse_rate": _safe_div(total_replayed_actions, total_actions),
         "avg_atomic_steps": sum(r["atomic_steps"] for r in rows) / n if n else None,
         "avg_tokens": sum(total_tokens) / n if n else None,
@@ -138,6 +173,59 @@ def aggregate_by_round(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "memory_bank_size": bank_sizes[-1] if bank_sizes else None,
         "memories_pruned_by_strikes_cum": sum(pruned) if pruned else None,
         "n_errors": sum(1 for r in rows if r.get("error")),
+    })
+  return summary
+
+
+def success_retention_rate(sequences: list[list[bool]]) -> Optional[float]:
+  """Paper Appendix E.2's Success Retention Rate (SRR):
+
+    SRR = P(x_{t+1}=1 | x_t=1)
+        = sum_t I(x_t=1 and x_{t+1}=1) / sum_t I(x_t=1)
+
+  computed over one or more outcome sequences `x = {x_1, ..., x_N}` (here,
+  one sequence per task = that task's success/fail outcome in round 1, 2,
+  ..., N, in round order). Consecutive-pair transitions from ALL provided
+  sequences are pooled into a single numerator/denominator, matching
+  Figure 5b's single SRR number per condition/model (not one SRR per task).
+  Sequences shorter than 2 rounds contribute no transitions and are
+  effectively ignored. Returns None if no task had >=2 rounds of data (or
+  no task ever succeeded, i.e. the denominator is 0).
+  """
+  numerator = 0
+  denominator = 0
+  for seq in sequences:
+    for t in range(len(seq) - 1):
+      if seq[t]:
+        denominator += 1
+        if seq[t + 1]:
+          numerator += 1
+  return _safe_div(numerator, denominator)
+
+
+def aggregate_srr_by_condition(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  """Groups by condition, builds each task's round-ordered success sequence,
+  and computes the pooled SRR (paper Appendix E.2 / Figure 5b) per
+  condition. Also returns `n_tasks_with_transitions` (tasks that had >=2
+  rounds recorded) for transparency."""
+  by_condition: dict[str, dict[str, dict[int, bool]]] = {}
+  for r in records:
+    cond = r["condition"]
+    task = r["task_name"]
+    by_condition.setdefault(cond, {}).setdefault(task, {})[r["round_idx"]] = bool(r["success"])
+
+  summary = []
+  for condition, per_task in sorted(by_condition.items()):
+    sequences = []
+    for task, round_to_success in per_task.items():
+      ordered_rounds = sorted(round_to_success.keys())
+      sequences.append([round_to_success[r] for r in ordered_rounds])
+    n_with_transitions = sum(1 for seq in sequences if len(seq) >= 2)
+    summary.append({
+        "condition": condition,
+        "n_tasks": len(sequences),
+        "n_tasks_with_transitions": n_with_transitions,
+        "success_retention_rate": success_retention_rate(sequences),
     })
   return summary
 

@@ -9,10 +9,15 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Optional
 
 from android_world.agents import m3a_utils
+from android_world.env import interface
 from android_world.env import representation_utils
+
+_logger = logging.getLogger(__name__)
 
 
 def describe_ui_element(
@@ -101,6 +106,70 @@ def find_element_by_description(
       ):
         substring_match = index
   return substring_match
+
+
+def get_robust_state(
+    env: interface.AsyncEnv,
+    min_elements: int = 2,
+    max_retries: int = 4,
+    retry_sleep_seconds: float = 1.5,
+    reset_on_failure: bool = True,
+) -> tuple[interface.State, bool]:
+  """`env.get_state()` guarded against AndroidWorld's occasional a11y-tree
+  degeneration bug (see `results/debug/zero_success_rate_diagnosis.md`):
+  the accessibility-forwarder app's gRPC handshake can race on a fresh env
+  session and return a single-node placeholder forest (just the root
+  container, no icons/text/clickables) that then never refreshes for the
+  rest of the episode -- silently blinding the agent for its whole
+  duration. `env.get_state(wait_to_stabilize=True)` does NOT catch this:
+  a frozen degenerate tree is trivially "stable" by that check's own
+  definition (same element list across repeated polls).
+
+  We instead detect degeneracy heuristically (suspiciously few UI
+  elements) and retry with backoff; if it's still degenerate half-way
+  through the retry budget we force one full `env.reset(go_home=True)`
+  (which re-runs AndroidWorld's AccessibilityForwarder setup/broadcast
+  sequence from scratch) before continuing to retry.
+
+  Returns:
+    (state, is_degenerate) -- `is_degenerate` is True if we exhausted all
+    retries (incl. the forced reset) while still seeing a suspiciously
+    empty UI, so callers can react (e.g. the Verifier must not trust a
+    "success" claim grounded in a blind observation -- see call sites in
+    `dms_agent_adapter.py` / `static_memory_agent.py` / `zero_shot_agent.py`).
+  """
+  state = env.get_state(wait_to_stabilize=False)
+  attempts = 0
+  did_reset = False
+  while len(state.ui_elements) < min_elements and attempts < max_retries:
+    attempts += 1
+    _logger.warning(
+        "get_robust_state: degenerate UI tree (%d elements), retry %d/%d.",
+        len(state.ui_elements), attempts, max_retries,
+    )
+    time.sleep(retry_sleep_seconds)
+    if (
+        reset_on_failure
+        and not did_reset
+        and attempts >= max(1, max_retries // 2)
+    ):
+      did_reset = True
+      _logger.warning(
+          "get_robust_state: still degenerate after %d retries, forcing"
+          " env.reset(go_home=True) to re-init the a11y forwarder.",
+          attempts,
+      )
+      env.reset(go_home=True)
+    state = env.get_state(wait_to_stabilize=False)
+
+  is_degenerate = len(state.ui_elements) < min_elements
+  if is_degenerate:
+    _logger.warning(
+        "get_robust_state: giving up after %d retries, still only %d UI"
+        " element(s). Proceeding with a possibly-blind observation.",
+        attempts, len(state.ui_elements),
+    )
+  return state, is_degenerate
 
 
 def build_som_screenshot(

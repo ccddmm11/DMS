@@ -22,16 +22,27 @@ import numpy as np
 # Force fully-local, no-network behavior BEFORE `sentence_transformers`/
 # `huggingface_hub` are ever imported (those libraries snapshot some of
 # these env vars as module-level constants at import time, so setting
-# them any later has no effect). This shared server's ambient shell sets
-# a SOCKS proxy (used for other tools) that `httpx` can't even construct
-# a client for unless the `socksio` extra is installed -- and we don't
-# need any proxy at all here once the embedding model has been downloaded
-# once, so we simply strip proxy env vars for this process and pin
-# offline mode.
-for _proxy_var in (
-    "all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY",
-    "https_proxy", "HTTPS_PROXY",
-):
+# them any later has no effect): the embedding model is fully cached
+# locally (see `_DEFAULT_CACHE_DIR`), so `HF_HUB_OFFLINE=1` guarantees
+# `huggingface_hub` never attempts a network call for it, regardless of
+# whatever proxy configuration the rest of the process needs.
+#
+# IMPORTANT: only strip the SOCKS proxy var (`all_proxy`), NOT
+# `http_proxy`/`https_proxy`. This module is imported unconditionally by
+# every eval worker (`scripts/run_eval_worker.py` imports all three agent
+# classes regardless of `--condition`), and OTHER code in that same
+# process legitimately needs the (plain HTTP) proxy, e.g. `android_env`'s
+# `A11yGrpcWrapper` unconditionally downloads its accessibility-forwarder
+# APK from `storage.googleapis.com` via plain `urllib.request` on every
+# `env_launcher.load_and_setup_env()` call; `urllib` happily uses
+# `http_proxy`/`https_proxy`, so leaving those alone keeps that working.
+# `all_proxy` is a SOCKS5 proxy that `httpx` (used internally by
+# `huggingface_hub`, which `sentence_transformers` still calls into for a
+# metadata HEAD check even with `HF_HUB_OFFLINE=1`) cannot construct a
+# transport for without the optional `socksio` extra -- so THAT one var
+# must still be stripped, or `SentenceTransformer(...)` raises an
+# `ImportError` immediately on construction.
+for _proxy_var in ("all_proxy", "ALL_PROXY"):
   os.environ.pop(_proxy_var, None)
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 

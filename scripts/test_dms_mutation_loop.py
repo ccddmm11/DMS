@@ -22,11 +22,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from android_world.env import representation_utils
 
+from src.agent import app_intent
 from src.agent.actor import ActorStepOutput
+from src.agent.planner import Planner
 from src.agent.planner import PlannerOutput
 from src.agent.planner import SubPlan
 from src.agent.verifier import VerifierOutput
 from src.androidworld_integration.dms_agent_adapter import DMSAgent
+from src.baselines.static_memory_agent import StaticMemoryAgent
 from src.memory import mutation
 from src.memory.memory_bank import MemoryBank
 from src.memory.memory_unit import MemoryUnit
@@ -67,6 +70,24 @@ def fresh_dir(path):
   if os.path.exists(path):
     shutil.rmtree(path)
   return path
+
+
+def test_task_app_guardrails():
+  print("[0/7] task app context: declared app launch + Planner prompt...")
+
+  class FakeLauncherEnv:
+    foreground_activity_name = "com.android.launcher3/.Launcher"
+
+  decision = app_intent.initial_task_app_fast_path_decision(
+      FakeLauncherEnv(), ["camera"], has_started_task_navigation=False
+  )
+  assert decision == ("open", "camera")
+  prompt = Planner(llm=None)._build_prompt(
+      "Take one photo.", [], "launcher UI", ["camera"]
+  )
+  assert "Declared target app(s) for this task: camera" in prompt
+  assert "Photos is not a substitute for Camera" in prompt
+  print("    OK: target app metadata forces Camera launch context, not Photos.")
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +178,9 @@ def test_replay_trajectory():
     def execute_action(self, action):
       self.executed_actions.append(action)
 
+    def reset(self, go_home=False):
+      del go_home
+
   # Original recording: click on "Save" at index 0. On replay, "Save" has
   # drifted to index 2 (two unrelated elements now precede it).
   trajectory = [
@@ -199,8 +223,10 @@ def test_decide_memory_update():
 
   # (b) No candidate, |tau|>=2 -> creates a new memory.
   fresh_tau = [
-      TrajectoryStep(reason="r0", action={"action_type": "click", "index": 0}),
-      TrajectoryStep(reason="r1", action={"action_type": "click", "index": 1}),
+      TrajectoryStep(reason="r0", action={"action_type": "click", "index": 0},
+                     target_element_desc="first button"),
+      TrajectoryStep(reason="r1", action={"action_type": "click", "index": 1},
+                     target_element_desc="second button"),
   ]
   outcome = mutation.decide_memory_update(bank, "p", "g", fresh_tau, candidate=None)
   assert outcome.action == "created" and len(bank) == 1
@@ -210,8 +236,10 @@ def test_decide_memory_update():
   # replacement (same memory_id, trajectory overwritten).
   candidate = bank.add(make_memory("p2", "g2", 4))
   shorter_tau = [
-      TrajectoryStep(reason="r0", action={"action_type": "click", "index": 0}),
-      TrajectoryStep(reason="r1", action={"action_type": "click", "index": 1}),
+      TrajectoryStep(reason="r0", action={"action_type": "click", "index": 0},
+                     target_element_desc="first button"),
+      TrajectoryStep(reason="r1", action={"action_type": "click", "index": 1},
+                     target_element_desc="second button"),
   ]
   outcome = mutation.decide_memory_update(bank, "p2", "g2", shorter_tau, candidate=candidate)
   assert outcome.action == "replaced" and outcome.memory_id == candidate.memory_id
@@ -223,9 +251,12 @@ def test_decide_memory_update():
   # memory is created; the candidate is left untouched.
   candidate2 = bank.add(make_memory("p3", "g3", 2))
   not_shorter_tau = [
-      TrajectoryStep(reason="r0", action={"action_type": "click", "index": 0}),
-      TrajectoryStep(reason="r1", action={"action_type": "click", "index": 1}),
-      TrajectoryStep(reason="r2", action={"action_type": "click", "index": 2}),
+      TrajectoryStep(reason="r0", action={"action_type": "click", "index": 0},
+                     target_element_desc="first button"),
+      TrajectoryStep(reason="r1", action={"action_type": "click", "index": 1},
+                     target_element_desc="second button"),
+      TrajectoryStep(reason="r2", action={"action_type": "click", "index": 2},
+                     target_element_desc="third button"),
   ]
   size_before = len(bank)
   outcome = mutation.decide_memory_update(bank, "p3", "g3", not_shorter_tau, candidate=candidate2)
@@ -233,6 +264,48 @@ def test_decide_memory_update():
   untouched = bank.get(candidate2.memory_id, load_trajectory=True)
   assert len(untouched.trajectory) == 2
   print("    OK: non-improving mutation creates a new memory, leaves candidate untouched.")
+
+  # (e) A repeated unanchored exploration loop is not a reusable memory.
+  repeated_scrolls = [
+      TrajectoryStep(
+          reason="searching",
+          action={"action_type": "scroll", "direction": "up"},
+      )
+      for _ in range(4)
+  ]
+  outcome = mutation.decide_memory_update(
+      bank, "p", "find settings", repeated_scrolls, candidate=None
+  )
+  assert outcome.action == "skipped_repeated_navigation"
+  print("    OK: repeated unanchored scroll loop is rejected before persistence.")
+
+  # (f) Index actions without a semantic target cannot be safely re-grounded.
+  ungroundable_tau = [
+      TrajectoryStep(reason="r0", action={"action_type": "click", "index": 0}),
+      TrajectoryStep(reason="r1", action={"action_type": "click", "index": 1}),
+  ]
+  outcome = mutation.decide_memory_update(
+      bank, "p", "unsafe clicks", ungroundable_tau, candidate=None
+  )
+  assert outcome.action == "skipped_unreplayable_index"
+  print("    OK: index trajectory without target descriptors is rejected.")
+
+  # (g) Repeating an action without any recorded UI change is an Actor loop,
+  # not a reusable trajectory. This also protects against slow replay loops.
+  stagnant_actions = [
+      TrajectoryStep(
+          reason="press Enter again",
+          action={"action_type": "keyboard_enter"},
+          state_signature="unchanged-ui",
+      )
+      for _ in range(3)
+  ]
+  outcome = mutation.decide_memory_update(
+      bank, "p", "confirm", stagnant_actions, candidate=None
+  )
+  assert outcome.action == "skipped_stagnant_actions"
+  assert mutation._has_repeated_stagnant_action(stagnant_actions)
+  print("    OK: unchanged-state repeated actions are rejected before replay.")
 
   shutil.rmtree(TEST_STORE_DIR + "_p3")
 
@@ -245,7 +318,8 @@ class StubPlanner:
     self.outputs = list(outputs)
     self.calls = 0
 
-  def plan(self, goal, history, ui_elements_str, screenshots):
+  def plan(self, goal, history, ui_elements_str, screenshots, task_apps=None):
+    del task_apps
     self.calls += 1
     return self.outputs.pop(0)
 
@@ -421,8 +495,49 @@ def test_full_loop_mutation_evolves_memory():
   shutil.rmtree(store_dir)
 
 
+def test_terminal_success_persists_active_trajectory():
+  print("[6/7] Ground-truth terminal success persists active trajectories...")
+  trajectory = [
+      TrajectoryStep(
+          reason="first action",
+          action={"action_type": "click", "index": 0},
+          target_element_desc="first",
+          state_signature="state-before",
+      ),
+      TrajectoryStep(
+          reason="second action",
+          action={"action_type": "click", "index": 1},
+          target_element_desc="second",
+          state_signature="state-after",
+      ),
+  ]
+
+  dms_store = fresh_dir(TEST_STORE_DIR + "_terminal_dms")
+  dms, _env = make_agent(dms_store, [ui_element("first"), ui_element("second")])
+  dms.current_sub_task = SubPlan("screen is ready", "complete the task")
+  dms.sub_task_trajectory = trajectory
+  dms.finalize_task(True)
+  assert len(dms.bank) == 1 and dms.usage.memories_created == 1
+
+  static_store = fresh_dir(TEST_STORE_DIR + "_terminal_static")
+  static = StaticMemoryAgent(
+      FakeAndroidEnv([ui_element("first"), ui_element("second")]),
+      llm=None,
+      memory_store_dir=static_store,
+      wait_after_action_seconds=0.0,
+  )
+  static.current_sub_task = SubPlan("screen is ready", "complete the task")
+  static.sub_task_trajectory = trajectory
+  static.finalize_task(True)
+  assert len(static.bank) == 1 and static.usage.memories_created == 1
+  print("    OK: evaluator-short-circuited success remains reusable memory.")
+
+  shutil.rmtree(dms_store)
+  shutil.rmtree(static_store)
+
+
 def test_strike_based_pruning():
-  print("[6/6] Repeated replay failures -> K_limit strikes -> memory pruned...")
+  print("[7/7] Repeated replay failures -> K_limit strikes -> memory pruned...")
   store_dir = fresh_dir(TEST_STORE_DIR + "_p6")
 
   agent, _env = make_agent(store_dir, [ui_element("X")])
@@ -447,11 +562,13 @@ def main():
   if os.path.exists(TEST_STORE_DIR):
     shutil.rmtree(TEST_STORE_DIR)
 
+  test_task_app_guardrails()
   test_decide_retrieval_and_reuse()
   test_replay_trajectory()
   test_decide_memory_update()
   test_full_loop_reuse_then_mutation()
   test_full_loop_mutation_evolves_memory()
+  test_terminal_success_persists_active_trajectory()
   test_strike_based_pruning()
 
   print("\nAll DMS mutation + main-loop checks passed.")
