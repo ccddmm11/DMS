@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Optional
 
@@ -149,5 +150,38 @@ class RepetitionBreaker:
     if self._streak >= self.max_repeats:
       self._last_goal = None
       self._streak = 0
+      return True
+    return False
+
+
+class StagnantActionBreaker:
+  """Breaks repeated identical actions against an unchanged UI state.
+
+  This is the live counterpart of memory write hygiene's stagnant-trajectory
+  check. It prevents an Actor from consuming a full local step budget on the
+  same click/scroll while preserving the same policy for all conditions.
+  """
+
+  def __init__(self, max_repeats: int = 2):
+    self.max_repeats = max_repeats
+    self._last_key: Optional[tuple[str, str]] = None
+    self._streak = 0
+
+  def reset(self) -> None:
+    self._last_key = None
+    self._streak = 0
+
+  def record_and_check(
+      self, state_signature: str, action: dict
+  ) -> bool:
+    """Returns True when the repeated action should force a replan."""
+    key = (state_signature, json.dumps(action, sort_keys=True))
+    if key == self._last_key:
+      self._streak += 1
+    else:
+      self._last_key = key
+      self._streak = 1
+    if self._streak >= self.max_repeats:
+      self.reset()
       return True
     return False

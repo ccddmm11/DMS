@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 from typing import Any, Optional
 
 import numpy as np
@@ -40,6 +41,45 @@ class SubPlan:
 
   def to_dict(self) -> dict[str, str]:
     return {"precondition": self.precondition, "goal": self.goal}
+
+
+_MICRO_INTERACTION_RE = re.compile(
+    r"^\s*(?:click|tap|press|type|enter|input|select|choose|scroll|swipe)\b",
+    flags=re.IGNORECASE,
+)
+_NAVIGATION_GOAL_RE = re.compile(
+    r"\b(?:open|launch|navigate|go to|return to|back)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def coarsen_sub_plans(
+    sub_plans: list[SubPlan], overall_goal: str
+) -> list[SubPlan]:
+  """Promotes tap-level plans to one task-level state transition.
+
+  Qwen-7B frequently emits a one-item plan such as "click the + button",
+  despite being told that the Actor owns individual taps. Such a plan makes
+  memory trajectories artificially one action long. Keep explicit navigation
+  transitions separate, but replace the remaining tap-level chain with the
+  user-visible end state so the Actor can execute and verify a reusable
+  multi-action procedure.
+  """
+  if not overall_goal or not sub_plans:
+    return sub_plans
+
+  coarsened: list[SubPlan] = []
+  promoted = False
+  for sub_plan in sub_plans:
+    is_micro = bool(_MICRO_INTERACTION_RE.search(sub_plan.goal))
+    is_navigation = bool(_NAVIGATION_GOAL_RE.search(sub_plan.goal))
+    if is_micro and not is_navigation:
+      if not promoted:
+        coarsened.append(SubPlan(sub_plan.precondition, overall_goal))
+        promoted = True
+      continue
+    coarsened.append(sub_plan)
+  return coarsened or sub_plans
 
 
 @dataclasses.dataclass
@@ -85,6 +125,14 @@ PLANNER_PROMPT_TEMPLATE = (
     ' (use "None" if not critical, e.g. for the very first step of a new'
     " sequence).\n"
     '  - "goal": the concrete, single functional objective for this step.\n\n'
+    "**Memory-aware granularity:** A sub-goal should describe a meaningful"
+    " state transition that the Actor may need several atomic actions to"
+    " complete, not an individual tap. Prefer \"create and save the contact"
+    " with the requested name and number\" over separate goals to tap +,"
+    " enter the name, enter the number, and tap Save. Use a one-click"
+    " sub-goal only when that click is an unavoidable standalone navigation"
+    " transition. This keeps successful trajectories reusable while the"
+    " Actor still decides each atomic UI action.\n\n"
     "**IMPORTANT -- sub-goals must be actionable, not just observational:**"
     " Always phrase each \"goal\" as a concrete UI INTERACTION to perform"
     ' (e.g. "click the \'Network & internet\' option", "toggle the Wi-Fi'
@@ -227,7 +275,9 @@ class Planner:
         ))
       except (KeyError, TypeError):
         continue
-    sub_plans = sub_plans[:MAX_SUB_PLANS_PER_CYCLE]
+    sub_plans = coarsen_sub_plans(
+        sub_plans[:MAX_SUB_PLANS_PER_CYCLE], goal
+    )
 
     return PlannerOutput(
         done=bool(parsed.get("done", False)),

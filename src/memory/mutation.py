@@ -38,6 +38,24 @@ from src.memory.risk import RiskRegulator
 
 _INDEX_BASED_ACTIONS = ("click", "long_press", "input_text", "scroll")
 
+# Precondition under which a whole-task memory is stored and later retrieved.
+# Several simple tasks are solved by the 7B-specific deterministic fast paths
+# (open_app / Quick-Settings / system-toggle) from the home screen WITHOUT
+# ever going through the Planner->sub-task->Actor->Verifier path that normally
+# drives `decide_memory_update`. That left the Memory Bank permanently empty
+# in preflight: every successful fast-path episode was thrown away. To make
+# the memory agents actually accumulate experience on these tasks, the agents
+# record the full episode's fresh actions as ONE task-level memory keyed by
+# (home-screen precondition, task goal), and at the start of the next round's
+# episode they attempt to REPLAY it BEFORE the fast paths preempt -- faithful
+# to Algorithm 1's Retrieve->Replay branch, lifted from sub-plan granularity
+# to whole-task granularity for the fast-path-solved tasks. All task-level
+# memories share this same constant precondition so the Dual-Factor product
+# reduces to goal-similarity ranking among them (pre-sim ~= 1.0).
+TASK_LEVEL_PRECONDITION = (
+    "On the Android home screen before starting the task."
+)
+
 # Minimum trajectory length to keep as a reusable memory (Sec 3.2.1: "To
 # prevent memory fragmentation, trajectories with |tau|=1 ... are filtered
 # out.").
@@ -180,10 +198,15 @@ def decide_retrieval_and_reuse(
     goal_query: str,
     config: Optional[MutationConfig] = None,
     rng: Optional[random.Random] = None,
+    precondition_must_equal: Optional[str] = None,
 ) -> RetrievalDecision:
   """Algorithm 1 line 9-13: Retrieve(M, pi), then gate reuse by risk + eps.
 
   `m != None and rho_m < tau_risk and Random() > epsilon => DoReuse`
+
+  `precondition_must_equal` is forwarded to `MemoryBank.retrieve` to restrict
+  the candidate set to one granularity (e.g. only whole-task memories for the
+  task-level Retrieve->Replay path); `None` means consider all memories.
   """
   config = config or MutationConfig()
   rng = rng or random
@@ -193,6 +216,7 @@ def decide_retrieval_and_reuse(
       goal_query,
       top_k=1,
       score_threshold=config.retrieval_score_threshold,
+      precondition_must_equal=precondition_must_equal,
   )
   if not results or not results[0].memory.trajectory:
     return RetrievalDecision(None, 0.0, False, False, False)

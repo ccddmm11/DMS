@@ -141,6 +141,29 @@ def main() -> int:
                             f"{len(_ZERO_SHOT_EMULATOR_POOL)}, since static_memory/dms "
                             "each require exactly 1 dedicated worker for their shared "
                             "evolving Memory Bank).")
+  parser.add_argument(
+      "--dms_initial_capacity",
+      type=int,
+      default=None,
+      help="Override DMS RegulationConfig.initial_capacity (Elbow-pruning trigger "
+           "threshold, default 60 = paper's 116-task scale). Lower to ~15 to "
+           "exercise the prune/expand branch on a 29-task subset. Only affects "
+           "the dms condition; static_memory/zero_shot are unaffected.",
+  )
+  parser.add_argument(
+      "--dms_capacity_step",
+      type=int,
+      default=None,
+      help="Override DMS RegulationConfig.capacity_step (default 20). Use ~3 on "
+           "small subsets so prune keeps firing after an expand.",
+  )
+  parser.add_argument(
+      "--dms_capacity_max",
+      type=int,
+      default=None,
+      help="Override DMS RegulationConfig.capacity_max (default 240). Lower to "
+           "~24 to bound bank growth on small subsets.",
+  )
   args = parser.parse_args()
 
   conditions = args.conditions.split(",")
@@ -197,6 +220,12 @@ def main() -> int:
       cmd += ["--tasks", spec["tasks"]]
     if args.round_limit_episodes:
       cmd += ["--round_limit_episodes", str(args.round_limit_episodes)]
+    if args.dms_initial_capacity is not None and spec["condition"] == "dms":
+      cmd += ["--dms_initial_capacity", str(args.dms_initial_capacity)]
+    if args.dms_capacity_step is not None and spec["condition"] == "dms":
+      cmd += ["--dms_capacity_step", str(args.dms_capacity_step)]
+    if args.dms_capacity_max is not None and spec["condition"] == "dms":
+      cmd += ["--dms_capacity_max", str(args.dms_capacity_max)]
 
     print(f"[harness] launching {label} (condition={spec['condition']}) on "
           f"console_port={spec['console_port']} -> log={log_path}")

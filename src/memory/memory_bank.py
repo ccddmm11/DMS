@@ -249,10 +249,17 @@ class MemoryBank:
       top_k: int = 1,
       score_threshold: float = 0.0,
       load_trajectory: bool = True,
+      precondition_must_equal: Optional[str] = None,
   ) -> list[RetrievalResult]:
     """Retrieves the top-k memories by the Dual-Factor Similarity Metric.
 
     Score(p_hat, p) = sim(phi(p_hat_pre), phi(p_pre)) * sim(phi(p_hat_goal), phi(p_goal))
+
+    `precondition_must_equal`: when set, only memories whose stored
+    `precondition` string equals this value are considered. Used by the
+    task-level Retrieve->Replay path to match ONLY whole-task memories
+    (keyed by the shared `_TASK_LEVEL_PRECONDITION`), never sub-plan
+    memories whose trajectory covers just one sub-goal.
 
     Note: this only *finds* candidates; it does NOT mutate reuse_count /
     last_used_at (those are updated via `record_reuse` only once the
@@ -266,6 +273,11 @@ class MemoryBank:
 
     scored = []
     for memory_id in self._memories:
+      if (
+          precondition_must_equal is not None
+          and self._memories[memory_id].precondition != precondition_must_equal
+      ):
+        continue
       pre_sim = cosine_similarity(pre_q, self._precond_emb[memory_id])
       goal_sim = cosine_similarity(goal_q, self._goal_emb[memory_id])
       scored.append((memory_id, pre_sim * goal_sim, pre_sim, goal_sim))

@@ -23,6 +23,7 @@ import faulthandler
 import logging
 import os
 import sys
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(
@@ -47,20 +48,38 @@ from src.baselines.zero_shot_agent import PALiteAgent
 from src.androidworld_integration.dms_agent_adapter import DMSAgent
 from src.eval.runner import RunConfig, run_condition
 from src.eval.task_suite import load_task_suite
+from src.memory.survival import RegulationConfig
 from src.vlm.qwen_vl_client import QwenVLConfig, QwenVLWrapper
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _build_agent(condition: str, env, llm, memory_root: str, rng_seed: int):
+def _build_agent(
+    condition: str,
+    env,
+    llm,
+    memory_root: str,
+    rng_seed: int,
+    dms_initial_capacity: Optional[int] = None,
+    dms_capacity_step: Optional[int] = None,
+    dms_capacity_max: Optional[int] = None,
+):
   if condition == "zero_shot":
     return PALiteAgent(env, llm)
   if condition == "static_memory":
     return StaticMemoryAgent(env, llm, memory_store_dir=os.path.join(memory_root, "static_memory"))
   if condition == "dms":
+    regulation_config = None
+    if dms_initial_capacity is not None or dms_capacity_step is not None or dms_capacity_max is not None:
+      regulation_config = RegulationConfig(
+          initial_capacity=dms_initial_capacity if dms_initial_capacity is not None else RegulationConfig().initial_capacity,
+          capacity_step=dms_capacity_step if dms_capacity_step is not None else RegulationConfig().capacity_step,
+          capacity_max=dms_capacity_max if dms_capacity_max is not None else RegulationConfig().capacity_max,
+      )
     return DMSAgent(
         env, llm, memory_store_dir=os.path.join(memory_root, "dms"),
         rng_seed=rng_seed,
+        regulation_config=regulation_config,
     )
   raise ValueError(f"Unknown condition: {condition}")
 
@@ -88,6 +107,29 @@ def main() -> int:
       type=float,
       default=0.0,
       help="Dump all Python thread stacks at this interval while debugging a stall.",
+  )
+  parser.add_argument(
+      "--dms_initial_capacity",
+      type=int,
+      default=None,
+      help="Override DMS RegulationConfig.initial_capacity (Elbow-pruning trigger "
+           "threshold). Default 60 is tuned for the paper's 116-task scale; lower "
+           "to ~15 to exercise the prune/expand branch on a 29-task subset.",
+  )
+  parser.add_argument(
+      "--dms_capacity_step",
+      type=int,
+      default=None,
+      help="Override RegulationConfig.capacity_step (how much expand raises the "
+           "cap). Default 20 is too coarse for small task subsets -- use ~3 so "
+           "prune keeps firing after an expand instead of the cap running away.",
+  )
+  parser.add_argument(
+      "--dms_capacity_max",
+      type=int,
+      default=None,
+      help="Override RegulationConfig.capacity_max (hard ceiling on the cap). "
+           "Default 240; lower to ~24 to bound bank growth on small subsets.",
   )
   args = parser.parse_args()
 
@@ -129,7 +171,12 @@ def main() -> int:
   agent_seed = args.base_seed + {"zero_shot": 0, "static_memory": 1, "dms": 2}[args.condition]
 
   def agent_factory():
-    return _build_agent(args.condition, env, llm, args.memory_root, agent_seed)
+    return _build_agent(
+        args.condition, env, llm, args.memory_root, agent_seed,
+        dms_initial_capacity=args.dms_initial_capacity,
+        dms_capacity_step=args.dms_capacity_step,
+        dms_capacity_max=args.dms_capacity_max,
+    )
 
   config = RunConfig(
       condition=args.condition,

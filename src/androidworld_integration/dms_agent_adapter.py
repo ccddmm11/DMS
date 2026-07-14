@@ -84,6 +84,10 @@ from src.memory.survival import SurvivalValueConfig
 
 _INDEX_BASED_ACTIONS = ("click", "long_press", "input_text", "scroll")
 
+# Whole-task memory precondition lives in `src/memory/mutation.py` so both the
+# DMS agent and Baseline B share one source of truth (see its docstring there).
+_TASK_LEVEL_PRECONDITION = mutation.TASK_LEVEL_PRECONDITION
+
 
 @dataclasses.dataclass
 class DMSUsageStats:
@@ -190,6 +194,7 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
 
     self.additional_guidelines = None  # kept for API parity with M3A/T3A.
     self._repetition_breaker = loop_guard.RepetitionBreaker()
+    self._stagnant_action_breaker = loop_guard.StagnantActionBreaker()
     self._reset_episode_state()
 
   # -- API parity with M3A/T3A ---------------------------------------------
@@ -224,6 +229,61 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
         and self.sub_task_trajectory
     ):
       self._succeed_current_sub_task_via_fresh_generation()
+
+    # Resolve a deferred task-level replay against ground truth. The replay
+    # itself ran inside one `step()` call (executing the whole stored
+    # trajectory), so the LLM Verifier never saw the final state -- we let the
+    # AndroidWorld evaluator be the truth and update reuse/strike bookkeeping
+    # here, exactly as the runner already does for episode termination.
+    pending = self._task_level_replay_pending
+    if pending is not None:
+      self._task_level_replay_pending = None
+      if task_succeeded:
+        self.usage.replay_successes += 1
+        self.risk_regulator.record_reuse_success(pending.memory_id, persist=False)
+        self.bank.record_reuse(pending.memory_id, persist=True)
+      else:
+        strikes = self.bank.record_verification_failure(
+            pending.memory_id, persist=False
+        )
+        if strikes >= self.mutation_config.k_limit:
+          self.bank.remove(pending.memory_id, persist=True)
+          self.usage.memories_pruned_by_strikes += 1
+        else:
+          self.bank.save()
+
+    # Task-level memory creation for episodes the fast paths / Actor solved
+    # fresh (no sub-task memory was written via the path above, and no pure
+    # replay happened -- `episode_trajectory` is empty for a pure-replay
+    # success). This is what makes DMS accumulate experience on the simple
+    # tasks that the 7B fast paths solve deterministically. If a retrieval
+    # `candidate` existed but was skipped (epsilon-mutation / risk suppression
+    # / a replay that aborted and was then re-solved fresh), `decide_memory_update`
+    # performs the in-place evolutionary replacement when the fresh trajectory
+    # is shorter (Sec 3.2.2).
+    if (
+        task_succeeded
+        and self.usage.memories_created == 0
+        and self.usage.memories_replaced == 0
+        and self.episode_trajectory
+    ):
+      outcome = mutation.decide_memory_update(
+          self.bank,
+          _TASK_LEVEL_PRECONDITION,
+          self._episode_task_goal,
+          self.episode_trajectory,
+          self._task_level_candidate,
+          source_task=self._current_task_name,
+      )
+      self.usage.record_memory_update(outcome.action)
+      if outcome.memory_id is not None:
+        self.episode_active_memory_ids.add(outcome.memory_id)
+        if outcome.action == "replaced":
+          # The mutation's trajectory "won" against the skipped candidate;
+          # treat it like a confirmed-good reuse for risk bookkeeping too.
+          self.risk_regulator.record_reuse_success(outcome.memory_id, persist=False)
+          self.bank.record_reuse(outcome.memory_id, persist=True)
+
     self.risk_regulator.record_global_task_outcome(
         list(self.episode_active_memory_ids), task_succeeded
     )
@@ -245,9 +305,25 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
     self.replan_cycles = 0
     self.usage = DMSUsageStats()
     self._repetition_breaker.reset()
+    self._stagnant_action_breaker.reset()
     self._task_navigation_started = False
     self._planner_completion_rejections = 0
     self._system_toggle_route_labels: list[str] = []
+
+    # -- Task-level memory tracking (see _TASK_LEVEL_PRECONDITION docstring).
+    # `episode_trajectory` collects EVERY fresh atomic action this episode
+    # (fast-path + Actor), so a fast-path-solved success can be persisted as
+    # one task-level memory in `finalize_task`. `_task_replay_attempted` gates
+    # the once-per-episode task-level retrieval. `_task_level_candidate` is
+    # the retrieval hit (if any) carried into `finalize_task` for epsilon
+    # mutation's in-place evolutionary replacement. `_task_level_replay_pending`
+    # defers a task-level replay's reuse/strike bookkeeping to ground truth.
+    self.episode_trajectory: list[TrajectoryStep] = []
+    self._episode_task_goal: str = ""
+    self._task_replay_attempted: bool = False
+    self._task_level_candidate: Optional[MemoryUnit] = None
+    self._task_level_replay_pending: Optional[MemoryUnit] = None
+    self._current_state_signature: str = ""
 
   def _advance_to_next_sub_task_slot(self) -> None:
     """Clears the "active sub-task" slot; the NEXT `step()` call will pop
@@ -258,6 +334,29 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
     self.sub_task_history = []
     self.sub_task_trajectory = []
     self.sub_task_step_count = 0
+
+  def _record_episode_step(
+      self,
+      reason: Optional[str],
+      action_dict: dict[str, Any],
+      target_element_desc: Optional[str],
+  ) -> None:
+    """Appends one fresh atomic action to the whole-episode trajectory.
+
+    Fast-path and Actor actions alike are recorded here so that an episode
+    the deterministic fast paths solve (which never enters the sub-task
+    memory-write path) can still be persisted as a task-level memory in
+    `finalize_task`. Replay actions are NOT recorded here -- a pure-replay
+    success already has its memory and must not be re-persisted.
+    """
+    self.episode_trajectory.append(
+        TrajectoryStep(
+            reason=reason or "",
+            action=dict(action_dict or {}),
+            target_element_desc=target_element_desc,
+            state_signature=self._current_state_signature,
+        )
+    )
 
   def _fail_current_sub_task(self, reason: str) -> None:
     assert self.current_sub_task is not None
@@ -354,6 +453,11 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
       )
       self.usage.atomic_actions_executed += 1
       step_data["action_reason"] = f"Deterministic open_app({app_name})."
+      self._record_episode_step(
+          f"open_app({app_name})",
+          {"action_type": "open_app", "app_name": app_name},
+          target_element_desc=None,
+      )
       time.sleep(self.wait_after_action_seconds)
       self._advance_after_fast_path(
           f"opened the '{app_name}' app directly (deterministic fast path)."
@@ -393,6 +497,11 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
       self.task_history.append(
           f"[Task setup] Opened declared target app '{app_name}' directly."
       )
+      self._record_episode_step(
+          f"open declared target app '{app_name}'",
+          {"action_type": "open_app", "app_name": app_name},
+          target_element_desc=None,
+      )
       time.sleep(self.wait_after_action_seconds)
     except Exception as e:  # pylint: disable=broad-exception-caught
       self.task_history.append(
@@ -424,6 +533,11 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
             " task; Settings exposes labeled controls more reliably than"
             " generic Quick Settings switches."
         )
+        self._record_episode_step(
+            "open Settings for system-toggle task",
+            {"action_type": "open_app", "app_name": "Settings"},
+            target_element_desc=None,
+        )
       else:
         self.env.execute_action(
             json_action.JSONAction(action_type="swipe", direction="down")
@@ -433,6 +547,11 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
         )
         action_reason = (
             "Deterministic top-edge pull-down to open Quick Settings."
+        )
+        self._record_episode_step(
+            "pull down Quick Settings",
+            {"action_type": "swipe", "direction": "down"},
+            target_element_desc=None,
         )
       self.usage.atomic_actions_executed += 1
       step_data["action_reason"] = action_reason
@@ -479,6 +598,11 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
           f"[System toggle setup] Clicked labeled Settings target '{label}'."
       )
       self._system_toggle_route_labels.append(label)
+      self._record_episode_step(
+          f"click labeled Settings target '{label}'",
+          action_dict,
+          target_element_desc=label,
+      )
       time.sleep(self.wait_after_action_seconds)
     except Exception as e:  # pylint: disable=broad-exception-caught
       self.task_history.append(
@@ -592,6 +716,67 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
         physical_frame_boundary,
         orientation,
     )
+
+    # Snapshot the pre-action UI signature once per step so every fast-path /
+    # Actor action recorded into `episode_trajectory` shares a consistent
+    # state_signature (used by the stagnant-trajectory write hygiene filter).
+    self._current_state_signature = hashlib.sha256(
+        ui_elements_str.encode("utf-8")
+    ).hexdigest()
+    # The eval harness drives the agent with `step(goal)` per atomic action;
+    # the goal string is identical across all steps of one episode, so capture
+    # it for the task-level memory key on the first step.
+    self._episode_task_goal = goal
+
+    # -- DMS task-level Retrieve->Replay (Algorithm 1 lines 9-13 lifted to
+    # whole-task granularity for fast-path-solved tasks). Attempted exactly
+    # once per episode, BEFORE the deterministic fast paths preempt, so a
+    # stored whole-task memory can be replayed instead of re-solved. On round
+    # 0 the bank is empty and this is a no-op; from round 1 on, a hit short-
+    # circuits the fast paths / Planner via replay. --
+    if (
+        self.current_sub_task is None
+        and not self.sub_plan_queue
+        and not self._task_replay_attempted
+        and self._episode_task_goal
+    ):
+      self._task_replay_attempted = True
+      task_decision = mutation.decide_retrieval_and_reuse(
+          self.bank,
+          self.risk_regulator,
+          _TASK_LEVEL_PRECONDITION,
+          self._episode_task_goal,
+          self.mutation_config,
+          self._rng,
+          precondition_must_equal=_TASK_LEVEL_PRECONDITION,
+      )
+      self.usage.retrieval_attempts += 1
+      if task_decision.candidate is not None:
+        self.usage.retrieval_hits += 1
+        self._task_level_candidate = task_decision.candidate
+        if task_decision.do_reuse:
+          self.current_sub_task = SubPlan(
+              precondition=_TASK_LEVEL_PRECONDITION,
+              goal=self._episode_task_goal,
+          )
+          self.sub_task_candidate = task_decision.candidate
+          step_data["phase"] = "task_replay"
+          step_data["sub_task"] = self.current_sub_task.to_dict()
+          step_data["retrieval"] = {
+              "hit": True,
+              "score": task_decision.score,
+              "do_reuse": True,
+              "is_mutation": False,
+              "is_risk_suppressed": False,
+          }
+          self.usage.replay_attempts += 1
+          return self._execute_task_level_replay(
+              step_data, task_decision.candidate
+          )
+        # Candidate existed but was skipped (epsilon-mutation or risk
+        # suppression): fall through to fresh generation; `_task_level_candidate`
+        # is kept for the evolutionary-replacement path in `finalize_task`.
+        self.usage.mutation_attempts += 1
 
     initial_task_app_result = self._maybe_open_initial_task_app_fast_path(
         step_data
@@ -788,6 +973,7 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
           ui_elements, converted_action.index
       )
 
+    action_executed = False
     try:
       self.env.execute_action(converted_action)
       self.sub_task_history.append(f"Reason: {reason} Action: {action_str}")
@@ -801,7 +987,11 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
               ).hexdigest(),
           )
       )
+      self._record_episode_step(
+          reason, converted_action.as_dict(), target_element_desc=target_desc
+      )
       self.usage.atomic_actions_executed += 1
+      action_executed = True
     except Exception as e:  # pylint: disable=broad-exception-caught
       self.sub_task_history.append(
           f"Reason: {reason} Action: {action_str} -> FAILED to execute"
@@ -809,6 +999,18 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
       )
 
     time.sleep(self.wait_after_action_seconds)
+
+    state_signature = hashlib.sha256(
+        ui_elements_str.encode("utf-8")
+    ).hexdigest()
+    if action_executed and self._stagnant_action_breaker.record_and_check(
+        state_signature, converted_action.as_dict()
+    ):
+      self._fail_current_sub_task(
+          "Stagnant: repeated the same action while the UI state was"
+          " unchanged; forcing a replan."
+      )
+      return base_agent.AgentInteractionResult(False, step_data)
 
     if self.sub_task_step_count >= self.max_actor_steps_per_subtask:
       after_state, after_degraded = ui_utils.get_robust_state(self.env)
@@ -861,4 +1063,47 @@ class DMSAgent(base_agent.EnvironmentInteractingAgent):
     else:
       self._fail_current_sub_task_via_reuse(candidate, verifier_output.reason)
 
+    return base_agent.AgentInteractionResult(False, step_data)
+
+  # -- Task-level replay (whole-task memory, ground-truth-deferred) ---------
+  def _execute_task_level_replay(
+      self, step_data: dict[str, Any], candidate: MemoryUnit
+  ) -> base_agent.AgentInteractionResult:
+    """Replays a whole-task memory (Sec 3.2.2 Replay(tau_retrieved)) but,
+    unlike the sub-task replay above, defers the success/strike verdict to
+    the AndroidWorld ground-truth evaluator rather than the 7B LLM Verifier.
+
+    The sub-task replay's LLM Verifier is a reasonable judge of a single
+    sub-goal, but for a WHOLE-task trajectory the 7B Verifier is an unreliable
+    judge of the overall task goal (it false-negatives multi-step state like
+    "is Wi-Fi now on"), and a false negative would charge an unfair strike
+    against a memory that actually worked -- eventually pruning good
+    memories. The runner already trusts ground truth for episode termination,
+    so we do the same here: execute the replay, mark it pending, and let
+    `finalize_task(task_succeeded)` resolve the bookkeeping.
+    """
+    replay_result = mutation.replay_trajectory(
+        candidate.trajectory, self.env, self.wait_after_action_seconds
+    )
+    step_data["replay_steps"] = replay_result.steps_replayed
+    self.usage.replayed_actions_executed += replay_result.steps_replayed
+    self.episode_active_memory_ids.add(candidate.memory_id)
+    self._task_level_replay_pending = candidate
+
+    if not replay_result.success_execution:
+      self.task_history.append(
+          f"Sub-task [{self.current_sub_task.as_prompt_str()}] task-level"
+          " replay aborted (could not re-ground a stored action against the"
+          " current UI); falling back to fresh generation."
+      )
+    else:
+      step_data["action_reason"] = (
+          "Replayed whole-task memory; verifier deferred to the AndroidWorld"
+          " ground-truth evaluator."
+      )
+      self.task_history.append(
+          f"Sub-task [{self.current_sub_task.as_prompt_str()}] replayed from"
+          " task-level memory (verifier deferred to ground-truth evaluator)."
+      )
+    self._advance_to_next_sub_task_slot()
     return base_agent.AgentInteractionResult(False, step_data)

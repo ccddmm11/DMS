@@ -67,7 +67,8 @@ class StubPlanner:
   def __init__(self, outputs):
     self.outputs = list(outputs)
 
-  def plan(self, goal, history, ui_elements_str, screenshots):
+  def plan(self, goal, history, ui_elements_str, screenshots, task_apps=None):
+    del task_apps
     return self.outputs.pop(0)
 
 

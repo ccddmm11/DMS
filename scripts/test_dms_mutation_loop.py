@@ -23,10 +23,12 @@ import numpy as np
 from android_world.env import representation_utils
 
 from src.agent import app_intent
+from src.agent import loop_guard
 from src.agent.actor import ActorStepOutput
 from src.agent.planner import Planner
 from src.agent.planner import PlannerOutput
 from src.agent.planner import SubPlan
+from src.agent.planner import coarsen_sub_plans
 from src.agent.verifier import VerifierOutput
 from src.androidworld_integration.dms_agent_adapter import DMSAgent
 from src.baselines.static_memory_agent import StaticMemoryAgent
@@ -87,6 +89,23 @@ def test_task_app_guardrails():
   )
   assert "Declared target app(s) for this task: camera" in prompt
   assert "Photos is not a substitute for Camera" in prompt
+  assert "Memory-aware granularity" in prompt
+  coarse = coarsen_sub_plans(
+      [SubPlan("Contacts home", "click the '+' button")],
+      "Create and save Maya Wang's contact with the requested phone number.",
+  )
+  assert len(coarse) == 1 and coarse[0].goal.startswith("Create and save")
+  navigation_then_coarse = coarsen_sub_plans(
+      [
+          SubPlan("Launcher", "open the Contacts app"),
+          SubPlan("Contacts home", "click the '+' button"),
+      ],
+      "Create and save Maya Wang's contact with the requested phone number.",
+  )
+  assert [p.goal for p in navigation_then_coarse] == [
+      "open the Contacts app",
+      "Create and save Maya Wang's contact with the requested phone number.",
+  ]
   print("    OK: target app metadata forces Camera launch context, not Photos.")
 
 
@@ -305,6 +324,11 @@ def test_decide_memory_update():
   )
   assert outcome.action == "skipped_stagnant_actions"
   assert mutation._has_repeated_stagnant_action(stagnant_actions)
+  breaker = loop_guard.StagnantActionBreaker(max_repeats=2)
+  action = {"action_type": "click", "index": 1}
+  assert not breaker.record_and_check("same-ui", action)
+  assert breaker.record_and_check("same-ui", action)
+  assert not breaker.record_and_check("changed-ui", action)
   print("    OK: unchanged-state repeated actions are rejected before replay.")
 
   shutil.rmtree(TEST_STORE_DIR + "_p3")
@@ -536,8 +560,38 @@ def test_terminal_success_persists_active_trajectory():
   shutil.rmtree(static_store)
 
 
+def test_live_stagnant_action_forces_replan():
+  print("[7/8] Repeated unchanged-state actions force a replan...")
+  store_dir = fresh_dir(TEST_STORE_DIR + "_stagnant_action")
+  agent, env = make_agent(store_dir, [ui_element("Add")])
+  agent.planner = StubPlanner([
+      PlannerOutput(done=False, sub_plans=[
+          SubPlan("Contacts home", "Create and save the requested contact.")
+      ]),
+  ])
+  agent.actor = StubActor([
+      ActorStepOutput(
+          reason="tap Add",
+          action_json_str='{"action_type": "click", "index": 0}',
+      ),
+      ActorStepOutput(
+          reason="tap Add again",
+          action_json_str='{"action_type": "click", "index": 0}',
+      ),
+  ])
+
+  agent.step("Create the requested contact.")
+  agent.step("Create the requested contact.")
+  assert agent.current_sub_task is None and not agent.sub_plan_queue
+  assert len(env.executed_actions) == 2
+  assert "Stagnant: repeated the same action" in agent.task_history[-1]
+  print("    OK: same action + unchanged UI fails the sub-task immediately.")
+
+  shutil.rmtree(store_dir)
+
+
 def test_strike_based_pruning():
-  print("[7/7] Repeated replay failures -> K_limit strikes -> memory pruned...")
+  print("[8/8] Repeated replay failures -> K_limit strikes -> memory pruned...")
   store_dir = fresh_dir(TEST_STORE_DIR + "_p6")
 
   agent, _env = make_agent(store_dir, [ui_element("X")])
@@ -558,6 +612,63 @@ def test_strike_based_pruning():
   shutil.rmtree(store_dir)
 
 
+def test_task_level_memory_write_and_replay():
+  print("[9/9] Task-level memory: fast-path success -> round-2 replay...")
+  from src.androidworld_integration.dms_agent_adapter import _TASK_LEVEL_PRECONDITION
+
+  store_dir = fresh_dir(TEST_STORE_DIR + "_tasklevel")
+  ui_elements = [ui_element("shutter"), ui_element("done")]
+  agent, _env = make_agent(store_dir, ui_elements, epsilon=0.15)
+  agent._rng = ScriptedRandom([0.9])  # round-2 roll > epsilon -> DoReuse.
+
+  goal = "Take one photo."
+  # Round 0: simulate a fast-path-solved episode (the sub-task memory-write
+  # path never fires) by recording the fresh actions directly into the
+  # episode trajectory, then confirm via ground truth.
+  agent._episode_task_goal = goal
+  agent._record_episode_step(
+      "open Camera", {"action_type": "open_app", "app_name": "Camera"},
+      target_element_desc=None,
+  )
+  agent._record_episode_step(
+      "click shutter", {"action_type": "click", "index": 0},
+      target_element_desc="shutter",
+  )
+  agent.finalize_task(True)
+  assert len(agent.bank) == 1, f"task-level memory not written, bank={len(agent.bank)}"
+  assert agent.usage.memories_created == 1
+  mem = agent.bank.all_memories()[0]
+  assert mem.precondition == _TASK_LEVEL_PRECONDITION
+  assert mem.goal == goal
+  print("    OK: round-0 fast-path episode persisted as a task-level memory"
+        " (bank=1, precondition=task-level).")
+
+  # Round 1: a fresh episode on the SAME task. The task-level retrieval at
+  # the top of step() must hit and replay the stored trajectory instead of
+  # re-solving via Planner / fast paths. A replay makes no LLM calls, so no
+  # Planner/Actor/Verifier stubs are needed.
+  agent._reset_episode_state()
+  agent._rng = ScriptedRandom([0.9])
+  result = agent.step(goal)
+  assert result.data["phase"] == "task_replay", (
+      f"expected phase=task_replay, got {result.data.get('phase')!r}")
+  assert agent.usage.retrieval_hits == 1
+  assert agent.usage.replay_attempts == 1
+  assert agent.usage.replayed_actions_executed == 2, (
+      f"expected 2 replayed actions, got {agent.usage.replayed_actions_executed}")
+  assert agent.usage.memory_reuse_rate > 0.0
+  # Resolve the deferred replay against ground truth (runner does this with
+  # task.is_successful; here we assert the positive outcome path).
+  agent.finalize_task(True)
+  assert agent.usage.replay_successes == 1
+  reloaded = agent.bank.get(mem.memory_id, load_trajectory=False)
+  assert reloaded.reuse_count == 1
+  print("    OK: round-1 task-level retrieval -> replay -> reuse_count=1,"
+        f" MRR={agent.usage.memory_reuse_rate:.2f}.")
+
+  shutil.rmtree(store_dir)
+
+
 def main():
   if os.path.exists(TEST_STORE_DIR):
     shutil.rmtree(TEST_STORE_DIR)
@@ -569,7 +680,9 @@ def main():
   test_full_loop_reuse_then_mutation()
   test_full_loop_mutation_evolves_memory()
   test_terminal_success_persists_active_trajectory()
+  test_live_stagnant_action_forces_replan()
   test_strike_based_pruning()
+  test_task_level_memory_write_and_replay()
 
   print("\nAll DMS mutation + main-loop checks passed.")
 

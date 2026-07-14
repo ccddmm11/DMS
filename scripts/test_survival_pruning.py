@@ -162,6 +162,34 @@ def test_regulator_prune_and_expand():
   )
   print("    OK: capacity_cap persisted across SelfRegulator reload.")
 
+  # --- Scenario C: mirror the live 29-task delivery run config exactly
+  # (initial_capacity=15) to confirm the prune branch fires at the exact
+  # threshold the cap15 re-run will hit mid-round-2. ---
+  bank3 = MemoryBank(os.path.join(TEST_STORE_DIR, "cap15_case"))
+  bank3.tick(200)
+  for i in range(9):
+    bank3.add(make_memory(i, reuse_count=15, last_used_at=195.0, app="GoodApp"))
+  for i in range(9, 16):
+    bank3.add(make_memory(i, reuse_count=0, last_used_at=0.0, app="BadApp"))
+  assert len(bank3) == 16
+  regulator3 = SelfRegulator(
+      bank3,
+      regulation_config=RegulationConfig(initial_capacity=15, capacity_max=240,
+                                          capacity_step=20, min_memories_for_elbow=5),
+  )
+  assert regulator3.capacity_cap == 15, (
+      f"Expected capacity_cap=15 (live cap15 config), got {regulator3.capacity_cap}"
+  )
+  result3 = regulator3.regulate()
+  print(f"    cap15 mirror: action={result3.action} size "
+        f"{result3.bank_size_before}->{result3.bank_size_after} "
+        f"cap {result3.capacity_cap_before}->{result3.capacity_cap_after}")
+  assert result3.action == "prune", (
+      f"cap15 run expects prune once bank>=15, got {result3.action}"
+  )
+  assert result3.bank_size_after < result3.bank_size_before, "Prune must shrink the bank."
+  print(f"    OK: cap15 fired prune, bank {result3.bank_size_before}->{result3.bank_size_after}.")
+
   shutil.rmtree(TEST_STORE_DIR)
 
 

@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import time
 from typing import Any, Optional
 
@@ -100,6 +101,7 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
     self.wait_after_action_seconds = wait_after_action_seconds
     self.additional_guidelines = None  # kept for API parity with M3A/T3A.
     self._repetition_breaker = loop_guard.RepetitionBreaker()
+    self._stagnant_action_breaker = loop_guard.StagnantActionBreaker()
     self._current_task_name: Optional[str] = None
     self._task_apps: list[str] = []
     self._reset_episode_state()
@@ -136,6 +138,7 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
     self.replan_cycles = 0
     self.usage = UsageStats()
     self._repetition_breaker.reset()
+    self._stagnant_action_breaker.reset()
     self._task_navigation_started = False
     self._planner_completion_rejections = 0
     self._system_toggle_route_labels: list[str] = []
@@ -592,10 +595,12 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
         )
       return base_agent.AgentInteractionResult(False, step_data)
 
+    action_executed = False
     try:
       self.env.execute_action(converted_action)
       self.sub_task_history.append(f"Reason: {reason} Action: {action_str}")
       self.usage.atomic_actions_executed += 1
+      action_executed = True
     except Exception as e:  # pylint: disable=broad-exception-caught
       self.sub_task_history.append(
           f"Reason: {reason} Action: {action_str} -> FAILED to execute"
@@ -603,6 +608,19 @@ class PALiteAgent(base_agent.EnvironmentInteractingAgent):
       )
 
     time.sleep(self.wait_after_action_seconds)
+
+    state_signature = hashlib.sha256(
+        ui_elements_str.encode("utf-8")
+    ).hexdigest()
+    if action_executed and self._stagnant_action_breaker.record_and_check(
+        state_signature, converted_action.as_dict()
+    ):
+      self._finish_sub_task(
+          False,
+          "Stagnant: repeated the same action while the UI state was"
+          " unchanged; forcing a replan.",
+      )
+      return base_agent.AgentInteractionResult(False, step_data)
 
     if self.sub_task_step_count >= self.max_actor_steps_per_subtask:
       after_state, after_degraded = ui_utils.get_robust_state(self.env)
