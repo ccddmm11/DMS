@@ -1,0 +1,43 @@
+{
+  "started_at": "2026-07-12T17:44:29",
+  "output_dir": "/mnt/diskA/uuy/home/DWS/results/eval/evolution_5round_20260712",
+  "conditions": [
+    "zero_shot",
+    "static_memory",
+    "dms"
+  ],
+  "rounds": 5,
+  "base_seed": 20260707,
+  "tasks": "CameraTakePhoto,CameraTakeVideo,SystemWifiTurnOn,ClockTimerEntry,AudioRecorderRecordAudio,ContactsAddContact,SimpleSmsSend,ExpenseAddSingle",
+  "zero_shot_workers": 2,
+  "workers": [
+    {
+      "label": "zero_shot_w0",
+      "condition": "zero_shot",
+      "console_port": 5554,
+      "grpc_port": 8554,
+      "tasks": "CameraTakePhoto,SystemWifiTurnOn,AudioRecorderRecordAudio,SimpleSmsSend"
+    },
+    {
+      "label": "zero_shot_w1",
+      "condition": "zero_shot",
+      "console_port": 5560,
+      "grpc_port": 8557,
+      "tasks": "CameraTakeVideo,ClockTimerEntry,ContactsAddContact,ExpenseAddSingle"
+    },
+    {
+      "label": "static_memory",
+      "condition": "static_memory",
+      "console_port": 5556,
+      "grpc_port": 8555,
+      "tasks": "CameraTakePhoto,CameraTakeVideo,SystemWifiTurnOn,ClockTimerEntry,AudioRecorderRecordAudio,ContactsAddContact,SimpleSmsSend,ExpenseAddSingle"
+    },
+    {
+      "label": "dms",
+      "condition": "dms",
+      "console_port": 5558,
+      "grpc_port": 8556,
+      "tasks": "CameraTakePhoto,CameraTakeVideo,SystemWifiTurnOn,ClockTimerEntry,AudioRecorderRecordAudio,ContactsAddContact,SimpleSmsSend,ExpenseAddSingle"
+    }
+  ]
+}

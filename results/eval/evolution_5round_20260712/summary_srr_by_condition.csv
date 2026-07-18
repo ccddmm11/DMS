@@ -1,0 +1,4 @@
+condition,n_tasks,n_tasks_with_transitions,success_retention_rate
+dms,8,8,1.0
+static_memory,8,8,1.0
+zero_shot,8,8,0.9

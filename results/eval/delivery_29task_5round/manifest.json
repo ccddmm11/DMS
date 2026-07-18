@@ -1,0 +1,43 @@
+{
+  "started_at": "2026-07-12T21:05:27",
+  "output_dir": "/mnt/diskA/uuy/home/DWS/results/eval/delivery_29task_5round",
+  "conditions": [
+    "zero_shot",
+    "static_memory",
+    "dms"
+  ],
+  "rounds": 5,
+  "base_seed": 20260707,
+  "tasks": null,
+  "zero_shot_workers": 2,
+  "workers": [
+    {
+      "label": "zero_shot_w0",
+      "condition": "zero_shot",
+      "console_port": 5554,
+      "grpc_port": 8554,
+      "tasks": "CameraTakePhoto,BrowserMultiply,ClockStopWatchRunning,FilesMoveFile,TurnOffWifiAndTurnOnBluetooth,MarkorMergeNotes,SimpleCalendarDeleteEvents,SimpleDrawProCreateDrawing,SimpleSmsSend,AudioRecorderRecordAudio,ExpenseAddMultiple,RecipeDeleteDuplicateRecipes,SportsTrackerActivityDuration,NotesTodoItemCount,RetroSavePlaylist"
+    },
+    {
+      "label": "zero_shot_w1",
+      "condition": "zero_shot",
+      "console_port": 5560,
+      "grpc_port": 8557,
+      "tasks": "CameraTakeVideo,ClockTimerEntry,ContactsAddContact,SystemWifiTurnOn,MarkorCreateNoteAndSms,SimpleCalendarAddOneEvent,TasksDueOnDate,SaveCopyOfReceiptTaskEval,SimpleSmsReply,ExpenseAddSingle,RecipeAddSingleRecipe,OsmAndMarker,VlcCreatePlaylist,RetroCreatePlaylist"
+    },
+    {
+      "label": "static_memory",
+      "condition": "static_memory",
+      "console_port": 5556,
+      "grpc_port": 8555,
+      "tasks": null
+    },
+    {
+      "label": "dms",
+      "condition": "dms",
+      "console_port": 5558,
+      "grpc_port": 8556,
+      "tasks": null
+    }
+  ]
+}

@@ -11,8 +11,24 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# 实验结果（可选）
-results/
+# 实验结果：默认忽略，仅放行报告引用的核心数据
+results/*
+!results/eval/
+results/eval/*
+!results/eval/delivery_29task_5round/
+!results/eval/delivery_29task_5round/**
+!results/eval/delivery_29task_5round_dmscap15/
+!results/eval/delivery_29task_5round_dmscap15/**
+!results/eval/evolution_5round_20260712/
+!results/eval/evolution_5round_20260712/**
+!results/debug/
+results/debug/*
+!results/debug/zero_success_rate_diagnosis.md
+
+# 仍忽略日志、记忆库，以及与 report/figures 重复的主矩阵图
+results/**/logs/
+results/**/memory_stores/
+results/eval/delivery_29task_5round/plots/
 
 # IDE
 .idea/
@@ -22,3 +38,7 @@ results/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 本地无关目录
+dms-androidworld-reproduction-main
+DMS-reproduction-master

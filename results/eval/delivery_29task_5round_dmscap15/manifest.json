@@ -1,0 +1,20 @@
+{
+  "started_at": "2026-07-13T16:39:23",
+  "output_dir": "/mnt/diskA/uuy/home/DWS/results/eval/delivery_29task_5round_dmscap15",
+  "conditions": [
+    "dms"
+  ],
+  "rounds": 5,
+  "base_seed": 20260707,
+  "tasks": null,
+  "zero_shot_workers": 2,
+  "workers": [
+    {
+      "label": "dms",
+      "condition": "dms",
+      "console_port": 5558,
+      "grpc_port": 8556,
+      "tasks": null
+    }
+  ]
+}
